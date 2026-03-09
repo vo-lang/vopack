@@ -1,0 +1,267 @@
+// Compression support for vopack.
+//
+// Implements LZ4 block compression (compatible with the standard LZ4 block format).
+//
+// LZ4 block format summary:
+//   A compressed block is a sequence of "sequences". Each sequence:
+//     1. Token byte: high nibble = literal length, low nibble = match length - 4
+//     2. Optional extra literal length bytes (if high nibble == 15, read uint8s until < 255)
+//     3. Literal bytes
+//     4. Offset: 2 bytes little-endian (distance back to match source)
+//     5. Optional extra match length bytes (if low nibble == 15, read uint8s until < 255)
+//   The last sequence has no match part (literals only, offset omitted).
+//
+// The decompressor needs to know the uncompressed size (stored in the Entry).
+package vopack
+
+import "errors"
+
+// Compress compresses src using LZ4 block format.
+// Returns compressed data, or nil if compression does not reduce size.
+func Compress(src []byte) []byte {
+	if len(src) == 0 {
+		return []byte{}
+	}
+
+	dst := make([]byte, 0, len(src))
+	srcLen := len(src)
+	const minMatch = 4
+	const lastLiterals = 5
+	const matchFindLimit = 12
+
+	if srcLen < matchFindLimit+1 {
+		// Too short to find matches; emit as single literal sequence.
+		dst = lz4EmitLiterals(dst, src)
+	} else {
+		hashTable := make([]uint32, 65536)
+		matchLimit := srcLen - lastLiterals
+		searchLimit := srcLen - matchFindLimit
+
+		anchor := 0 // start of pending literals
+		pos := 0
+
+		for pos <= searchLimit {
+			h := lz4Hash(src[pos:])
+			idx := int(h)
+			candidatePlusOne := hashTable[idx]
+			hashTable[idx] = uint32(pos + 1)
+			found := candidatePlusOne != 0
+			candidate := int(candidatePlusOne - 1)
+
+			// Check for match: must be within 65535 offset and actually match 4 bytes
+			if !found || pos-candidate > 65535 || !lz4Match4(src, candidate, pos) {
+				pos++
+				continue
+			}
+
+			// Found a match. Extend it forward.
+			matchLen := minMatch
+			for pos+matchLen < matchLimit && candidate+matchLen < srcLen && src[candidate+matchLen] == src[pos+matchLen] {
+				matchLen++
+			}
+
+			// Emit sequence: literals + match
+			offset := pos - candidate
+			dst = lz4EmitSequence(dst, src[anchor:pos], matchLen, offset)
+
+			pos += matchLen
+			anchor = pos
+		}
+
+		// Emit remaining bytes as the final literal-only sequence (no match part).
+		if anchor < srcLen {
+			dst = lz4EmitLiterals(dst, src[anchor:srcLen])
+		}
+	}
+
+	// If compressed is not smaller, return nil to signal "don't compress".
+	if len(dst) >= srcLen {
+		return nil
+	}
+	return dst
+}
+
+// Decompress decompresses LZ4 block data into a buffer of the given raw size.
+func Decompress(src []byte, rawSize int) ([]byte, error) {
+	if rawSize < 0 {
+		return nil, errors.New("vopack: negative raw size")
+	}
+	if rawSize == 0 {
+		if len(src) != 0 {
+			return nil, errors.New("vopack: unexpected compressed data for empty output")
+		}
+		return []byte{}, nil
+	}
+	dst := make([]byte, rawSize)
+	sPos := 0
+	dPos := 0
+
+	for sPos < len(src) {
+		// Read token
+		token := src[sPos]
+		sPos++
+
+		// Literal length
+		litLen := int(token >> 4)
+		if litLen == 15 {
+			for {
+				if sPos >= len(src) {
+					return nil, errors.New("vopack: lz4 truncated literal length")
+				}
+				extra := src[sPos]
+				sPos++
+				litLen += int(extra)
+				if extra != 255 {
+					break
+				}
+			}
+		}
+
+		// Copy literals
+		if sPos+litLen > len(src) {
+			return nil, errors.New("vopack: lz4 literal overflow")
+		}
+		if dPos+litLen > rawSize {
+			return nil, errors.New("vopack: lz4 output overflow on literals")
+		}
+		copy(dst[dPos:], src[sPos:sPos+litLen])
+		sPos += litLen
+		dPos += litLen
+
+		// If we've consumed all input, this was the last (literal-only) sequence.
+		if sPos >= len(src) {
+			break
+		}
+
+		// Read match offset (2 bytes LE)
+		if sPos+2 > len(src) {
+			return nil, errors.New("vopack: lz4 truncated offset")
+		}
+		offset := int(src[sPos]) | int(src[sPos+1])<<8
+		sPos += 2
+		if offset == 0 {
+			return nil, errors.New("vopack: lz4 zero offset")
+		}
+
+		// Match length
+		matchLen := int(token&0x0F) + 4
+		if matchLen == 19 { // 15 + 4
+			for {
+				if sPos >= len(src) {
+					return nil, errors.New("vopack: lz4 truncated match length")
+				}
+				extra := src[sPos]
+				sPos++
+				matchLen += int(extra)
+				if extra != 255 {
+					break
+				}
+			}
+		}
+
+		// Copy match (byte-by-byte to handle overlapping copies)
+		matchStart := dPos - offset
+		if matchStart < 0 {
+			return nil, errors.New("vopack: lz4 match before start")
+		}
+		if dPos+matchLen > rawSize {
+			return nil, errors.New("vopack: lz4 output overflow on match")
+		}
+		for i := 0; i < matchLen; i++ {
+			dst[dPos] = dst[matchStart+i]
+			dPos++
+		}
+	}
+
+	if dPos != rawSize {
+		return nil, errors.New("vopack: lz4 output size mismatch")
+	}
+	return dst, nil
+}
+
+// --- LZ4 internal helpers ---
+
+// lz4Hash computes a 32-bit hash from 4 bytes for the hash table.
+func lz4Hash(data []byte) uint32 {
+	v := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24
+	return (v * 2654435761) >> 16
+}
+
+// lz4Match4 checks if 4 bytes at positions a and b in src are equal.
+func lz4Match4(src []byte, a int, b int) bool {
+	return src[a] == src[b] && src[a+1] == src[b+1] && src[a+2] == src[b+2] && src[a+3] == src[b+3]
+}
+
+// lz4EmitSequence appends a full LZ4 sequence (literals + match) to dst.
+func lz4EmitSequence(dst []byte, literals []byte, matchLen int, offset int) []byte {
+	// Encode token
+	litCode := len(literals)
+	matchCode := matchLen - 4
+	tokenLit := litCode
+	tokenMatch := matchCode
+	if tokenLit > 15 {
+		tokenLit = 15
+	}
+	if tokenMatch > 15 {
+		tokenMatch = 15
+	}
+	dst = append(dst, byte(tokenLit<<4|tokenMatch))
+
+	// Extra literal length bytes
+	if litCode >= 15 {
+		remaining := litCode - 15
+		for remaining >= 255 {
+			dst = append(dst, 255)
+			remaining -= 255
+		}
+		dst = append(dst, byte(remaining))
+	}
+
+	// Literal bytes
+	dst = append(dst, literals...)
+
+	// Match offset (2 bytes LE)
+	dst = append(dst, byte(offset&0xFF), byte((offset>>8)&0xFF))
+
+	// Extra match length bytes
+	if matchCode >= 15 {
+		remaining := matchCode - 15
+		for remaining >= 255 {
+			dst = append(dst, 255)
+			remaining -= 255
+		}
+		dst = append(dst, byte(remaining))
+	}
+
+	return dst
+}
+
+// lz4EmitLiterals appends a literal-only terminal sequence to dst.
+// This is the last sequence in an LZ4 block — no match/offset follows.
+func lz4EmitLiterals(dst []byte, literals []byte) []byte {
+	litLen := len(literals)
+	if litLen == 0 {
+		return dst
+	}
+
+	// Token: literal length in high nibble, match = 0 in low nibble
+	tokenLit := litLen
+	if tokenLit > 15 {
+		tokenLit = 15
+	}
+	dst = append(dst, byte(tokenLit<<4))
+
+	// Extra literal length bytes
+	if litLen >= 15 {
+		remaining := litLen - 15
+		for remaining >= 255 {
+			dst = append(dst, 255)
+			remaining -= 255
+		}
+		dst = append(dst, byte(remaining))
+	}
+
+	// Literal bytes
+	dst = append(dst, literals...)
+	return dst
+}

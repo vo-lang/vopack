@@ -1,0 +1,203 @@
+// PackReader provides read-only access to a vopack archive.
+//
+// On Open, it reads the footer, path pool, and entry table into memory,
+// then builds a hash map for O(1) path lookup. Data is read on demand.
+package vopack
+
+import (
+	"errors"
+	"os"
+)
+
+// tableEntry is the in-memory index entry for a single resource.
+type tableEntry struct {
+	dataOffset  uint64
+	rawSize     uint64
+	storedSize  uint64
+	compression uint8
+	checksum    uint32
+}
+
+// PackReader reads resources from a .vpak archive.
+type PackReader struct {
+	file    *os.File
+	index   map[string]tableEntry
+	paths   []string // all paths in insertion order
+}
+
+// Open opens an existing .vpak archive for reading.
+//
+// It validates the header, footer, path pool, and entry table before building
+// the in-memory index, so malformed archives fail during Open instead of later
+// during path lookup.
+func Open(path string) (*PackReader, error) {
+	file := os.Open(path)?
+	errdefer file.Close()
+
+	// Read footer from the last 32 bytes
+	info := file.Stat()?
+	fileSize := info.Size()
+	if fileSize < int64(headerSize+footerSize) {
+		fail errors.New("vopack: file too small")
+	}
+
+	ftrBuf := make([]byte, footerSize)
+	file.ReadAt(ftrBuf, fileSize-int64(footerSize))?
+	ftr := unmarshalFooter(ftrBuf)?
+
+	// Validate header
+	hdrBuf := make([]byte, headerSize)
+	file.ReadAt(hdrBuf, 0)?
+	hdr := unmarshalHeader(hdrBuf)?
+
+	fileSizeU := uint64(fileSize)
+	footerOff := fileSizeU - footerSize
+	if ftr.pathPoolOff > footerOff {
+		fail errors.New("vopack: invalid path pool offset")
+	}
+	if ftr.pathPoolSize > footerOff-ftr.pathPoolOff {
+		fail errors.New("vopack: invalid path pool size")
+	}
+	pathPoolEnd := ftr.pathPoolOff + ftr.pathPoolSize
+	if hdr.dataOff != headerSize {
+		fail errors.New("vopack: invalid data offset")
+	}
+	dataEnd := hdr.dataOff + hdr.dataSize
+	if dataEnd < hdr.dataOff || dataEnd != ftr.pathPoolOff {
+		fail errors.New("vopack: invalid data size")
+	}
+	entryTableSize := uint64(ftr.entryCount) * uint64(entrySize)
+	if ftr.entryTableOff < pathPoolEnd || ftr.entryTableOff > footerOff {
+		fail errors.New("vopack: invalid entry table offset")
+	}
+	if entryTableSize > footerOff-ftr.entryTableOff {
+		fail errors.New("vopack: invalid entry table size")
+	}
+
+	// Read path pool
+	var pathPool []byte
+	if ftr.pathPoolSize > 0 {
+		pathPool = make([]byte, ftr.pathPoolSize)
+		file.ReadAt(pathPool, int64(ftr.pathPoolOff))?
+	}
+
+	// Read entry table
+	var entryBuf []byte
+	if ftr.entryCount > 0 {
+		entryTableSize := int(ftr.entryCount) * entrySize
+		entryBuf = make([]byte, entryTableSize)
+		file.ReadAt(entryBuf, int64(ftr.entryTableOff))?
+	}
+
+	// Build index
+	index := make(map[string]tableEntry)
+	paths := make([]string, 0, int(ftr.entryCount))
+
+	for i := 0; i < int(ftr.entryCount); i++ {
+		e := unmarshalEntry(entryBuf[i*entrySize : (i+1)*entrySize])?
+		pathEnd := uint64(e.pathOffset) + uint64(e.pathLen)
+		if pathEnd > uint64(len(pathPool)) {
+			fail errors.New("vopack: entry path out of bounds")
+		}
+		if e.flags != 0 {
+			fail errors.New("vopack: unsupported entry flags")
+		}
+		if e.compression != CompressNone && e.compression != CompressLZ4 {
+			fail errors.New("vopack: unsupported compression method")
+		}
+		if e.dataOffset < hdr.dataOff || e.dataOffset > dataEnd {
+			fail errors.New("vopack: entry data offset out of bounds")
+		}
+		if e.storedSize > dataEnd-e.dataOffset {
+			fail errors.New("vopack: entry data size out of bounds")
+		}
+		if e.compression == CompressNone && e.rawSize != e.storedSize {
+			fail errors.New("vopack: uncompressed entry size mismatch")
+		}
+		name := string(pathPool[e.pathOffset : e.pathOffset+uint32(e.pathLen)])
+		if _, ok := index[name]; ok {
+			fail errors.New("vopack: duplicate resource path: " + name)
+		}
+		index[name] = tableEntry{
+			dataOffset:  e.dataOffset,
+			rawSize:     e.rawSize,
+			storedSize:  e.storedSize,
+			compression: e.compression,
+			checksum:    e.checksum,
+		}
+		paths = append(paths, name)
+	}
+
+	return &PackReader{
+		file:  file,
+		index: index,
+		paths: paths,
+	}, nil
+}
+
+// Read returns the decompressed content of a resource by its path.
+//
+// Stored bytes are checksum-verified before optional decompression.
+func (r *PackReader) Read(name string) ([]byte, error) {
+	te, ok := r.index[name]
+	if !ok {
+		fail errors.New("vopack: resource not found: " + name)
+	}
+
+	// Read stored (possibly compressed) data from disk
+	stored := make([]byte, te.storedSize)
+	r.file.ReadAt(stored, int64(te.dataOffset))?
+
+	// Verify checksum
+	if crc32(stored) != te.checksum {
+		fail errors.New("vopack: checksum mismatch: " + name)
+	}
+
+	// Decompress if needed
+	if te.compression == CompressLZ4 {
+		return Decompress(stored, int(te.rawSize))
+	}
+	return stored, nil
+}
+
+// Has returns true if the archive contains a resource with the given path.
+func (r *PackReader) Has(name string) bool {
+	_, ok := r.index[name]
+	return ok
+}
+
+// Size returns the uncompressed size of a resource.
+func (r *PackReader) Size(name string) (uint64, error) {
+	te, ok := r.index[name]
+	if !ok {
+		fail errors.New("vopack: resource not found: " + name)
+	}
+	return te.rawSize, nil
+}
+
+// Len returns the total number of resources in the archive.
+func (r *PackReader) Len() int {
+	return len(r.index)
+}
+
+// List returns all resource paths that start with the given prefix.
+// If prefix is empty, all paths are returned.
+func (r *PackReader) List(prefix string) []string {
+	if prefix == "" {
+		result := make([]string, len(r.paths))
+		copy(result, r.paths)
+		return result
+	}
+	result := make([]string, 0)
+	for _, p := range r.paths {
+		if len(p) >= len(prefix) && p[:len(prefix)] == prefix {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// Close closes the underlying file.
+func (r *PackReader) Close() error {
+	return r.file.Close()
+}

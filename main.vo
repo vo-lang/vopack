@@ -1,0 +1,22 @@
+// Package vopack provides a compact archive format for bundling application or game assets into a single .vpak file.
+//
+// A vopack archive is optimized for simple asset packaging and fast indexed lookup rather than general-purpose filesystem
+// emulation. Entry bytes are written sequentially into a data region, while the path string pool and fixed-size entry table
+// are appended near the end of the file and described by a footer. This layout keeps writes simple and lets Open build an
+// in-memory path index with a single metadata pass.
+//
+// The package provides the following guarantees:
+//   - resource paths are unique within one archive
+//   - footer metadata is validated when an archive is opened
+//   - stored entry bytes are checksum-verified when a resource is read
+//   - LZ4 compression is optional and transparent to callers of Read
+//   - listing preserves insertion order within a single archive
+//
+// The main workflows are:
+//   - Create, Add, AddFile, and Close for writing archives
+//   - Open, Read, Has, Size, and List for indexed read-only access
+//   - MountSet for priority-based overlay across multiple archives, where higher-priority archives shadow lower-priority ones
+//
+// This makes vopack suitable for shipped assets, patch or hot-update bundles, DLC layers, and mod loading where deterministic
+// path lookup matters more than full directory semantics.
+package vopack

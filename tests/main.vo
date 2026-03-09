@@ -1,0 +1,500 @@
+package main
+
+import (
+	"encoding/binary"
+	"github.com/vo-lang/vopack"
+	"os"
+	"path/filepath"
+)
+
+func assert(cond bool, msg string) {
+	if !cond {
+		panic("FAIL: " + msg)
+	}
+}
+
+func mustReadFile(path string) []byte {
+	data, err := os.ReadFile(path)
+	assert(err == nil, "read file: "+path)
+	return data
+}
+
+func entryTableOffset(data []byte) int {
+	footerOff := len(data) - 32
+	return int(binary.LittleEndian.Uint64(data[footerOff+16 : footerOff+24]))
+}
+
+func entryOffset(data []byte, entryIndex int, fieldOffset int) int {
+	return entryTableOffset(data) + entryIndex*48 + fieldOffset
+}
+
+func finalLZ4LiteralLen(src []byte) int {
+	sPos := 0
+	lastLitLen := 0
+	for sPos < len(src) {
+		token := src[sPos]
+		sPos++
+
+		litLen := int(token >> 4)
+		if litLen == 15 {
+			for {
+				extra := src[sPos]
+				sPos++
+				litLen += int(extra)
+				if extra != 255 {
+					break
+				}
+			}
+		}
+
+		sPos += litLen
+		lastLitLen = litLen
+		if sPos >= len(src) {
+			return lastLitLen
+		}
+
+		sPos += 2
+		matchLen := int(token&0x0F) + 4
+		if matchLen == 19 {
+			for {
+				extra := src[sPos]
+				sPos++
+				matchLen += int(extra)
+				if extra != 255 {
+					break
+				}
+			}
+		}
+	}
+	return lastLitLen
+}
+
+func main() {
+	tmpDir, err := os.MkdirTemp("", "vopack-test-")
+	assert(err == nil, "create temp dir")
+	defer os.RemoveAll(tmpDir)
+
+	testBasicRoundTrip(tmpDir)
+	testCompression(tmpDir)
+	testMultipleEntries(tmpDir)
+	testRejectDuplicatePaths(tmpDir)
+	testRejectUnsupportedCompression(tmpDir)
+	testRejectCorruptHeaderDataOffset(tmpDir)
+	testRejectUncompressedSizeMismatch(tmpDir)
+	testRejectCorruptReservedEntryBytes(tmpDir)
+	testListPrefix(tmpDir)
+	testMountOverlay(tmpDir)
+	testEmptyArchive(tmpDir)
+	testAlignmentLayout(tmpDir)
+	testLZ4Compress()
+	testLZ4StandardEnding()
+	testLZ4RejectMalformedInput()
+
+	println("ALL TESTS PASSED")
+}
+
+func testBasicRoundTrip(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "basic.vpak"})
+
+	// Write
+	w, err := vopack.Create(path)
+	assert(err == nil, "create basic archive")
+
+	err = w.Add("hello.txt", []byte("Hello, vopack!"), vopack.EntryOpts{})
+	assert(err == nil, "add hello.txt")
+
+	err = w.Close()
+	assert(err == nil, "close writer")
+
+	// Read
+	r, err := vopack.Open(path)
+	assert(err == nil, "open basic archive")
+
+	assert(r.Has("hello.txt"), "has hello.txt")
+	assert(!r.Has("nope.txt"), "has nope.txt should be false")
+
+	data, err := r.Read("hello.txt")
+	assert(err == nil, "read hello.txt")
+	assert(string(data) == "Hello, vopack!", "content mismatch: "+string(data))
+
+	size, err := r.Size("hello.txt")
+	assert(err == nil, "size hello.txt")
+	assert(size == 14, "size should be 14")
+
+	assert(r.Len() == 1, "len should be 1")
+
+	err = r.Close()
+	assert(err == nil, "close reader")
+}
+
+func testCompression(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "compressed.vpak"})
+
+	// Create repetitive data that compresses well
+	data := make([]byte, 4096)
+	for i := 0; i < len(data); i++ {
+		data[i] = byte(i % 10) + 'A'
+	}
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create compressed archive")
+
+	err = w.Add("data.bin", data, vopack.EntryOpts{Compression: vopack.CompressLZ4})
+	assert(err == nil, "add compressed entry")
+
+	err = w.Close()
+	assert(err == nil, "close compressed writer")
+
+	// Read back
+	r, err := vopack.Open(path)
+	assert(err == nil, "open compressed archive")
+
+	result, err := r.Read("data.bin")
+	assert(err == nil, "read compressed data")
+	assert(len(result) == 4096, "decompressed size mismatch")
+
+	// Verify content
+	for i := 0; i < len(data); i++ {
+		assert(result[i] == data[i], "content byte mismatch at index")
+	}
+
+	err = r.Close()
+	assert(err == nil, "close compressed reader")
+}
+
+func testMultipleEntries(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "multi.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create multi archive")
+
+	err = w.Add("a.txt", []byte("aaa"), vopack.EntryOpts{})
+	assert(err == nil, "add a.txt")
+	err = w.Add("b.txt", []byte("bbb"), vopack.EntryOpts{})
+	assert(err == nil, "add b.txt")
+	err = w.Add("c.txt", []byte("ccc"), vopack.EntryOpts{})
+	assert(err == nil, "add c.txt")
+
+	err = w.Close()
+	assert(err == nil, "close multi writer")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open multi archive")
+
+	assert(r.Len() == 3, "multi len should be 3")
+
+	da, err := r.Read("a.txt")
+	assert(err == nil, "read a.txt")
+	db, err := r.Read("b.txt")
+	assert(err == nil, "read b.txt")
+	dc, err := r.Read("c.txt")
+	assert(err == nil, "read c.txt")
+	assert(string(da) == "aaa", "a content")
+	assert(string(db) == "bbb", "b content")
+	assert(string(dc) == "ccc", "c content")
+
+	err = r.Close()
+	assert(err == nil, "close multi reader")
+}
+
+func testRejectDuplicatePaths(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "duplicate.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create duplicate archive")
+
+	err = w.Add("dup.txt", []byte("first"), vopack.EntryOpts{})
+	assert(err == nil, "add first duplicate candidate")
+
+	err = w.Add("dup.txt", []byte("second"), vopack.EntryOpts{})
+	assert(err != nil, "duplicate path should fail")
+
+	err = w.Close()
+	assert(err == nil, "close duplicate archive")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open duplicate archive")
+	assert(r.Len() == 1, "duplicate archive should contain exactly one entry")
+
+	data, err := r.Read("dup.txt")
+	assert(err == nil, "read surviving duplicate entry")
+	assert(string(data) == "first", "duplicate archive should retain first entry")
+
+	err = r.Close()
+	assert(err == nil, "close duplicate archive reader")
+}
+
+func testRejectUnsupportedCompression(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "unsupported-compression.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create unsupported compression archive")
+
+	err = w.Add("bad.bin", []byte("x"), vopack.EntryOpts{Compression: 99})
+	assert(err != nil, "unsupported compression should fail")
+
+	err = w.Close()
+	assert(err == nil, "close unsupported compression archive")
+}
+
+func testRejectCorruptHeaderDataOffset(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "corrupt-header.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create corrupt header archive")
+	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
+	assert(err == nil, "add corrupt header entry")
+	err = w.Close()
+	assert(err == nil, "close corrupt header archive")
+
+	data, err := os.ReadFile(path)
+	assert(err == nil, "read corrupt header archive")
+	data[8] = 0
+	err = os.WriteFile(path, data, 0644)
+	assert(err == nil, "rewrite corrupt header archive")
+
+	_, err = vopack.Open(path)
+	assert(err != nil, "corrupt header data offset should fail")
+}
+
+func testRejectUncompressedSizeMismatch(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "size-mismatch.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create size mismatch archive")
+	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
+	assert(err == nil, "add size mismatch entry")
+	err = w.Close()
+	assert(err == nil, "close size mismatch archive")
+
+	data, err := os.ReadFile(path)
+	assert(err == nil, "read size mismatch archive")
+	footerOff := len(data) - 32
+	entryTableOff := int(binary.LittleEndian.Uint64(data[footerOff+16 : footerOff+24]))
+	binary.LittleEndian.PutUint64(data[entryTableOff+16:], 99)
+	err = os.WriteFile(path, data, 0644)
+	assert(err == nil, "rewrite size mismatch archive")
+
+	_, err = vopack.Open(path)
+	assert(err != nil, "uncompressed size mismatch should fail")
+}
+
+func testRejectCorruptReservedEntryBytes(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "reserved-bytes.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create reserved bytes archive")
+	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
+	assert(err == nil, "add reserved bytes entry")
+	err = w.Close()
+	assert(err == nil, "close reserved bytes archive")
+
+	data := mustReadFile(path)
+	data[entryOffset(data, 0, 36)] = 1
+	err = os.WriteFile(path, data, 0644)
+	assert(err == nil, "rewrite reserved bytes archive")
+
+	_, err = vopack.Open(path)
+	assert(err != nil, "non-zero reserved entry bytes should fail")
+}
+
+func testListPrefix(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "list.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create list archive")
+
+	err = w.Add("textures/sky.png", []byte("sky"), vopack.EntryOpts{})
+	assert(err == nil, "add textures/sky.png")
+	err = w.Add("textures/ground.png", []byte("ground"), vopack.EntryOpts{})
+	assert(err == nil, "add textures/ground.png")
+	err = w.Add("sounds/bgm.ogg", []byte("bgm"), vopack.EntryOpts{})
+	assert(err == nil, "add sounds/bgm.ogg")
+	err = w.Add("config.json", []byte("{}"), vopack.EntryOpts{})
+	assert(err == nil, "add config.json")
+	err = w.Close()
+	assert(err == nil, "close list archive")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open list archive")
+
+	all := r.List("")
+	assert(len(all) == 4, "list all should be 4")
+
+	textures := r.List("textures/")
+	assert(len(textures) == 2, "list textures/ should be 2")
+
+	sounds := r.List("sounds/")
+	assert(len(sounds) == 1, "list sounds/ should be 1")
+
+	none := r.List("nope/")
+	assert(len(none) == 0, "list nope/ should be 0")
+
+	err = r.Close()
+	assert(err == nil, "close list reader")
+}
+
+func testMountOverlay(tmpDir string) {
+	basePath := filepath.Join([]string{tmpDir, "base.vpak"})
+	patchPath := filepath.Join([]string{tmpDir, "patch.vpak"})
+
+	// Base archive
+	w, err := vopack.Create(basePath)
+	assert(err == nil, "create base archive")
+	err = w.Add("hero.png", []byte("base-hero"), vopack.EntryOpts{})
+	assert(err == nil, "add base hero")
+	err = w.Add("enemy.png", []byte("base-enemy"), vopack.EntryOpts{})
+	assert(err == nil, "add base enemy")
+	err = w.Close()
+	assert(err == nil, "close base archive")
+
+	// Patch archive overrides hero
+	w, err = vopack.Create(patchPath)
+	assert(err == nil, "create patch archive")
+	err = w.Add("hero.png", []byte("patched-hero"), vopack.EntryOpts{})
+	assert(err == nil, "add patch hero")
+	err = w.Add("new-item.png", []byte("new-item"), vopack.EntryOpts{})
+	assert(err == nil, "add patch item")
+	err = w.Close()
+	assert(err == nil, "close patch archive")
+
+	// Mount with priority
+	m := vopack.NewMountSet()
+	err = m.Mount(basePath, 0)
+	assert(err == nil, "mount base")
+	err = m.Mount(patchPath, 10)
+	assert(err == nil, "mount patch")
+
+	// Patch should override hero
+	hero, err := m.Read("hero.png")
+	assert(err == nil, "read hero from mount")
+	assert(string(hero) == "patched-hero", "hero should be patched")
+
+	// Base enemy still accessible
+	enemy, err := m.Read("enemy.png")
+	assert(err == nil, "read enemy from mount")
+	assert(string(enemy) == "base-enemy", "enemy should be base")
+
+	// New item from patch
+	item, err := m.Read("new-item.png")
+	assert(err == nil, "read new-item from mount")
+	assert(string(item) == "new-item", "new-item content")
+
+	// List should be merged and deduplicated
+	all := m.List("")
+	assert(len(all) == 3, "mount list should be 3 (hero, enemy, new-item)")
+
+	assert(m.Has("hero.png"), "mount has hero")
+	assert(!m.Has("nope.png"), "mount has nope should be false")
+
+	err = m.Close()
+	assert(err == nil, "close mount set")
+}
+
+func testEmptyArchive(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "empty.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create empty archive")
+	err = w.Close()
+	assert(err == nil, "close empty writer")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open empty archive")
+	assert(r.Len() == 0, "empty archive len should be 0")
+	assert(!r.Has("anything"), "empty has should be false")
+
+	all := r.List("")
+	assert(len(all) == 0, "empty list should be 0")
+
+	err = r.Close()
+	assert(err == nil, "close empty archive reader")
+}
+
+func testAlignmentLayout(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "alignment.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create alignment archive")
+	err = w.Add("a.bin", []byte("abc"), vopack.EntryOpts{})
+	assert(err == nil, "add a.bin")
+	err = w.Add("b.bin", []byte("payload"), vopack.EntryOpts{Alignment: 64})
+	assert(err == nil, "add b.bin")
+	err = w.Close()
+	assert(err == nil, "close alignment archive")
+
+	data := mustReadFile(path)
+	bDataOff := binary.LittleEndian.Uint64(data[entryOffset(data, 1, 8):])
+	assert(bDataOff%64 == 0, "aligned entry data offset should be 64-byte aligned")
+}
+
+func testLZ4Compress() {
+	// Test round-trip on various data patterns
+
+	// 1. Empty
+	c := vopack.Compress([]byte{})
+	assert(len(c) == 0, "compress empty")
+	d, err := vopack.Decompress(c, 0)
+	assert(err == nil, "decompress empty")
+	assert(len(d) == 0, "decompress empty len")
+
+	// 2. Short data (< 13 bytes, cannot compress smaller)
+	short := []byte("Hello!")
+	c = vopack.Compress(short)
+	assert(c == nil, "short data should not compress")
+
+	// 3. Highly repetitive data
+	rep := make([]byte, 10000)
+	for i := 0; i < len(rep); i++ {
+		rep[i] = byte(i % 4)
+	}
+	c = vopack.Compress(rep)
+	assert(c != nil, "repetitive should compress")
+	assert(len(c) < len(rep), "compressed should be smaller")
+	d, err = vopack.Decompress(c, len(rep))
+	assert(err == nil, "decompress repetitive")
+	for i := 0; i < len(rep); i++ {
+		assert(d[i] == rep[i], "repetitive byte mismatch")
+	}
+
+	// 4. Random-ish data (may not compress)
+	rnd := make([]byte, 1000)
+	for i := 0; i < len(rnd); i++ {
+		rnd[i] = byte((i*7 + 13) % 256)
+	}
+	c = vopack.Compress(rnd)
+	if c != nil {
+		// If it did compress, verify round-trip
+		d, err = vopack.Decompress(c, len(rnd))
+		assert(err == nil, "decompress random")
+		for i := 0; i < len(rnd); i++ {
+			assert(d[i] == rnd[i], "random byte mismatch")
+		}
+	}
+	// c == nil means compression didn't help — that's expected for random data
+}
+
+func testLZ4StandardEnding() {
+	rep := make([]byte, 4096)
+	for i := 0; i < len(rep); i++ {
+		rep[i] = byte(i % 4)
+	}
+
+	c := vopack.Compress(rep)
+	assert(c != nil, "standard ending input should compress")
+	assert(finalLZ4LiteralLen(c) >= 5, "compressed block should end with at least 5 trailing literals")
+
+	d, err := vopack.Decompress(c, len(rep))
+	assert(err == nil, "decompress standard ending block")
+	for i := 0; i < len(rep); i++ {
+		assert(d[i] == rep[i], "standard ending byte mismatch")
+	}
+}
+
+func testLZ4RejectMalformedInput() {
+	_, err := vopack.Decompress([]byte{0}, 0)
+	assert(err != nil, "non-empty compressed data for empty output should fail")
+
+	_, err = vopack.Decompress([]byte{0x1f, 'A', 0x01, 0x00, 0xff}, 275)
+	assert(err != nil, "truncated match length should fail")
+}

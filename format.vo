@@ -1,0 +1,217 @@
+// Binary format definitions for vopack archive files (.vpak).
+//
+// File layout:
+//   ┌─────────────────────────────────┐
+//   │  File Header       (64 bytes)   │
+//   ├─────────────────────────────────┤
+//   │  Data Region                    │
+//   │    entry 0 data (aligned)       │
+//   │    entry 1 data (aligned)       │
+//   │    ...                          │
+//   ├─────────────────────────────────┤
+//   │  Path String Pool               │
+//   │    "sprites/hero.pngtex..."     │  (offset+length, no separators)
+//   ├─────────────────────────────────┤
+//   │  Entry Table (48 bytes each)    │
+//   │    [entry0][entry1]...          │
+//   ├─────────────────────────────────┤
+//   │  Footer              (32 bytes) │
+//   └─────────────────────────────────┘
+//
+// Reading sequence:
+//   1. Seek to EOF - footerSize, read footer
+//   2. Validate footer checksum
+//   3. Read path pool and entry table using footer offsets
+//   4. Build in-memory path -> entry index
+//
+// All integers are little-endian.
+package vopack
+
+import (
+	"encoding/binary"
+	"errors"
+)
+
+const (
+	magic   = "VPAK"
+	version = 1
+
+	headerSize = 64
+	entrySize  = 48
+	footerSize = 32
+
+	defaultAlignment = 16
+
+	// Header field offsets
+	offHdrMagic    = 0
+	offHdrVersion  = 4
+	offHdrFlags    = 5
+	offHdrDataOff  = 8
+	offHdrDataSize = 16
+
+	// Entry field offsets
+	offEntPathOff     = 0
+	offEntPathLen     = 4
+	offEntCompression = 6
+	offEntFlags       = 7
+	offEntDataOff     = 8
+	offEntRawSize     = 16
+	offEntStoredSize  = 24
+	offEntChecksum    = 32
+	offEntReserved    = 36
+
+	// Footer field offsets
+	offFtrPathPoolOff  = 0
+	offFtrPathPoolSize = 8
+	offFtrEntryTableOff = 16
+	offFtrEntryCount   = 24
+	offFtrChecksum     = 28
+
+	// CompressNone stores entry bytes exactly as provided.
+	CompressNone = 0
+	// CompressLZ4 stores entry bytes using LZ4 block compression.
+	CompressLZ4  = 1
+)
+
+// fileHeader is the in-memory representation of the 64-byte file header.
+type fileHeader struct {
+	flags    uint8
+	dataOff  uint64
+	dataSize uint64
+}
+
+// entry is the in-memory representation of one archived resource.
+type entry struct {
+	pathOffset  uint32
+	pathLen     uint16
+	compression uint8
+	flags       uint8
+	dataOffset  uint64
+	rawSize     uint64
+	storedSize  uint64
+	checksum    uint32
+}
+
+// footer is the in-memory representation of the 32-byte footer.
+type footer struct {
+	pathPoolOff  uint64
+	pathPoolSize uint64
+	entryTableOff uint64
+	entryCount   uint32
+}
+
+// marshalHeader encodes a fileHeader into a 64-byte buffer.
+func marshalHeader(h fileHeader) []byte {
+	buf := make([]byte, headerSize)
+	copy(buf[offHdrMagic:], []byte(magic))
+	buf[offHdrVersion] = version
+	buf[offHdrFlags] = h.flags
+	binary.LittleEndian.PutUint64(buf[offHdrDataOff:], h.dataOff)
+	binary.LittleEndian.PutUint64(buf[offHdrDataSize:], h.dataSize)
+	return buf
+}
+
+// unmarshalHeader decodes a 64-byte buffer into a fileHeader.
+func unmarshalHeader(buf []byte) (fileHeader, error) {
+	if len(buf) < headerSize {
+		return fileHeader{}, errors.New("vopack: header too short")
+	}
+	if string(buf[offHdrMagic:offHdrMagic+4]) != magic {
+		return fileHeader{}, errors.New("vopack: invalid magic")
+	}
+	if buf[offHdrVersion] != version {
+		return fileHeader{}, errors.New("vopack: unsupported version")
+	}
+	return fileHeader{
+		flags:    buf[offHdrFlags],
+		dataOff:  binary.LittleEndian.Uint64(buf[offHdrDataOff:]),
+		dataSize: binary.LittleEndian.Uint64(buf[offHdrDataSize:]),
+	}, nil
+}
+
+// marshalEntry encodes an entry into a 48-byte buffer.
+func marshalEntry(e entry) []byte {
+	buf := make([]byte, entrySize)
+	binary.LittleEndian.PutUint32(buf[offEntPathOff:], e.pathOffset)
+	binary.LittleEndian.PutUint16(buf[offEntPathLen:], e.pathLen)
+	buf[offEntCompression] = e.compression
+	buf[offEntFlags] = e.flags
+	binary.LittleEndian.PutUint64(buf[offEntDataOff:], e.dataOffset)
+	binary.LittleEndian.PutUint64(buf[offEntRawSize:], e.rawSize)
+	binary.LittleEndian.PutUint64(buf[offEntStoredSize:], e.storedSize)
+	binary.LittleEndian.PutUint32(buf[offEntChecksum:], e.checksum)
+	return buf
+}
+
+// unmarshalEntry decodes a 48-byte buffer into an entry.
+func unmarshalEntry(buf []byte) (entry, error) {
+	if len(buf) < entrySize {
+		return entry{}, errors.New("vopack: entry too short")
+	}
+	for i := offEntReserved; i < entrySize; i++ {
+		if buf[i] != 0 {
+			return entry{}, errors.New("vopack: non-zero reserved entry bytes")
+		}
+	}
+	return entry{
+		pathOffset:  binary.LittleEndian.Uint32(buf[offEntPathOff:]),
+		pathLen:     binary.LittleEndian.Uint16(buf[offEntPathLen:]),
+		compression: buf[offEntCompression],
+		flags:       buf[offEntFlags],
+		dataOffset:  binary.LittleEndian.Uint64(buf[offEntDataOff:]),
+		rawSize:     binary.LittleEndian.Uint64(buf[offEntRawSize:]),
+		storedSize:  binary.LittleEndian.Uint64(buf[offEntStoredSize:]),
+		checksum:    binary.LittleEndian.Uint32(buf[offEntChecksum:]),
+	}, nil
+}
+
+// marshalFooter encodes a footer into a 32-byte buffer with checksum.
+func marshalFooter(f footer) []byte {
+	buf := make([]byte, footerSize)
+	binary.LittleEndian.PutUint64(buf[offFtrPathPoolOff:], f.pathPoolOff)
+	binary.LittleEndian.PutUint64(buf[offFtrPathPoolSize:], f.pathPoolSize)
+	binary.LittleEndian.PutUint64(buf[offFtrEntryTableOff:], f.entryTableOff)
+	binary.LittleEndian.PutUint32(buf[offFtrEntryCount:], f.entryCount)
+	binary.LittleEndian.PutUint32(buf[offFtrChecksum:], crc32(buf[:offFtrChecksum]))
+	return buf
+}
+
+// unmarshalFooter decodes a 32-byte buffer into a footer.
+func unmarshalFooter(buf []byte) (footer, error) {
+	if len(buf) < footerSize {
+		return footer{}, errors.New("vopack: footer too short")
+	}
+	stored := binary.LittleEndian.Uint32(buf[offFtrChecksum:])
+	computed := crc32(buf[:offFtrChecksum])
+	if stored != computed {
+		return footer{}, errors.New("vopack: footer checksum mismatch")
+	}
+	return footer{
+		pathPoolOff:  binary.LittleEndian.Uint64(buf[offFtrPathPoolOff:]),
+		pathPoolSize: binary.LittleEndian.Uint64(buf[offFtrPathPoolSize:]),
+		entryTableOff: binary.LittleEndian.Uint64(buf[offFtrEntryTableOff:]),
+		entryCount:   binary.LittleEndian.Uint32(buf[offFtrEntryCount:]),
+	}, nil
+}
+
+// crc32 computes CRC-32 (IEEE) over data.
+func crc32(data []byte) uint32 {
+	var crc uint32 = 0xFFFFFFFF
+	for _, b := range data {
+		crc ^= uint32(b)
+		for i := 0; i < 8; i++ {
+			if crc&1 != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
+}
+
+// alignUp rounds offset up to the given alignment boundary.
+func alignUp(offset uint64, alignment uint32) uint64 {
+	a := uint64(alignment)
+	return (offset + a - 1) & ^(a - 1)
+}

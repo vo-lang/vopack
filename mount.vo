@@ -1,0 +1,124 @@
+// MountSet manages multiple vopack archives with priority-based overlay.
+//
+// Higher priority archives shadow lower priority ones for the same path.
+// For equal priority, earlier mounts keep precedence.
+// This enables DLC, hot-update, and mod workflows:
+//   m := vopack.NewMountSet()
+//   m.Mount("base.vpak", 0)       // base game assets
+//   m.Mount("dlc1.vpak", 10)      // DLC overrides some base assets
+//   m.Mount("mod.vpak", 100)      // mod overrides everything
+//   data, err := m.Read("sprites/hero.png")  // returns from highest priority
+package vopack
+
+import "errors"
+
+// mountEntry pairs a reader with its priority.
+type mountEntry struct {
+	path     string
+	priority int
+	reader   *PackReader
+}
+
+// MountSet overlays multiple .vpak archives by priority.
+type MountSet struct {
+	mounts []mountEntry // sorted by descending priority
+}
+
+// NewMountSet creates an empty mount set.
+func NewMountSet() *MountSet {
+	return &MountSet{
+		mounts: make([]mountEntry, 0),
+	}
+}
+
+// Mount opens and registers an archive at the given priority.
+// Higher priority archives are searched first, and equal priorities preserve
+// mount order.
+func (m *MountSet) Mount(path string, priority int) error {
+	r := Open(path)?
+	m.mounts = append(m.mounts, mountEntry{
+		path:     path,
+		priority: priority,
+		reader:   r,
+	})
+	// Insertion sort by descending priority (mount count is small)
+	for i := len(m.mounts) - 1; i > 0; i-- {
+		if m.mounts[i].priority > m.mounts[i-1].priority {
+			m.mounts[i], m.mounts[i-1] = m.mounts[i-1], m.mounts[i]
+		} else {
+			break
+		}
+	}
+	return nil
+}
+
+// Unmount removes and closes the archive at the given path.
+func (m *MountSet) Unmount(path string) error {
+	for i, me := range m.mounts {
+		if me.path == path {
+			err := me.reader.Close()
+			m.mounts = append(m.mounts[:i], m.mounts[i+1:]...)
+			return err
+		}
+	}
+	fail errors.New("vopack: archive not mounted: " + path)
+}
+
+// Read returns the resource from the highest-priority archive that contains it.
+func (m *MountSet) Read(name string) ([]byte, error) {
+	for _, me := range m.mounts {
+		if me.reader.Has(name) {
+			return me.reader.Read(name)
+		}
+	}
+	return nil, errors.New("vopack: resource not found in any mount: " + name)
+}
+
+// Has returns true if any mounted archive contains the resource.
+func (m *MountSet) Has(name string) bool {
+	for _, me := range m.mounts {
+		if me.reader.Has(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Size returns the uncompressed size from the highest-priority archive.
+func (m *MountSet) Size(name string) (uint64, error) {
+	for _, me := range m.mounts {
+		if me.reader.Has(name) {
+			return me.reader.Size(name)
+		}
+	}
+	return 0, errors.New("vopack: resource not found in any mount: " + name)
+}
+
+// List returns all resource paths matching prefix, merged and deduplicated
+// across all mounted archives. Higher-priority entries take precedence.
+func (m *MountSet) List(prefix string) []string {
+	seen := make(map[string]bool)
+	result := make([]string, 0)
+	// Iterate in priority order (highest first)
+	for _, me := range m.mounts {
+		for _, p := range me.reader.List(prefix) {
+			if !seen[p] {
+				seen[p] = true
+				result = append(result, p)
+			}
+		}
+	}
+	return result
+}
+
+// Close closes all mounted archives.
+func (m *MountSet) Close() error {
+	var firstErr error
+	for _, me := range m.mounts {
+		if err := me.reader.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	m.mounts = m.mounts[:0]
+	return firstErr
+}

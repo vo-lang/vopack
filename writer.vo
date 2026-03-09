@@ -1,0 +1,188 @@
+// PackWriter builds a vopack archive file.
+//
+// Usage:
+//   w, err := vopack.Create("assets.vpak")
+//   w.Add("sprites/hero.png", data, vopack.EntryOpts{})
+//   w.AddFile("sounds/bgm.ogg", "/path/to/bgm.ogg", vopack.EntryOpts{Compression: vopack.CompressLZ4})
+//   w.Close()
+//
+// Data is written sequentially: header first, then each entry's data as it is added.
+// On Close, the path pool, entry table, and footer are appended.
+package vopack
+
+import (
+	"errors"
+	"os"
+)
+
+// EntryOpts controls per-entry options when adding resources.
+type EntryOpts struct {
+	Compression uint8  // CompressNone or CompressLZ4
+	Alignment   uint32 // 0 = default (16 bytes); otherwise must be a power of two
+}
+
+// writerEntry stores metadata collected during writing.
+type writerEntry struct {
+	path        string
+	compression uint8
+	dataOffset  uint64
+	rawSize     uint64
+	storedSize  uint64
+	checksum    uint32
+}
+
+// PackWriter writes resources into a .vpak archive.
+type PackWriter struct {
+	file    *os.File
+	offset  uint64       // current write position in the file
+	entries []writerEntry
+	names   map[string]bool
+}
+
+// Create opens a new .vpak file for writing.
+//
+// Resource paths must be unique within a single archive.
+func Create(path string) (*PackWriter, error) {
+	file := os.Create(path)?
+	errdefer file.Close()
+
+	// Write placeholder header (will be updated on Close)
+	file.Write(marshalHeader(fileHeader{dataOff: headerSize}))?
+
+	return &PackWriter{
+		file:    file,
+		offset:  headerSize,
+		entries: make([]writerEntry, 0),
+		names:   make(map[string]bool),
+	}, nil
+}
+
+// Add writes a resource from a byte slice into the archive.
+//
+// The archive preserves insertion order for listing, but duplicate paths are
+// rejected so lookup and listing remain consistent.
+func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
+	if w.names[name] {
+		fail errors.New("vopack: duplicate resource path: " + name)
+	}
+	if len(name) > 0xFFFF {
+		fail errors.New("vopack: resource path too long: " + name)
+	}
+
+	alignment := opts.Alignment
+	if alignment == 0 {
+		alignment = defaultAlignment
+	} else if alignment&(alignment-1) != 0 {
+		fail errors.New("vopack: alignment must be a power of two")
+	}
+
+	// Align the write position
+	aligned := alignUp(w.offset, alignment)
+	if aligned > w.offset {
+		pad := make([]byte, aligned-w.offset)
+		w.file.Write(pad)?
+		w.offset = aligned
+	}
+
+	rawSize := uint64(len(data))
+	storedData := data
+	compression := opts.Compression
+	if compression != CompressNone && compression != CompressLZ4 {
+		fail errors.New("vopack: unsupported compression method")
+	}
+
+	if compression == CompressLZ4 {
+		if len(data) > 0 {
+			if compressed := Compress(data); compressed != nil {
+				storedData = compressed
+			} else {
+				// Compression didn't help, store uncompressed
+				compression = CompressNone
+			}
+		} else {
+			compression = CompressNone
+		}
+	}
+
+	storedSize := uint64(len(storedData))
+	checksum := crc32(storedData)
+
+	w.file.Write(storedData)?
+
+	w.entries = append(w.entries, writerEntry{
+		path:        name,
+		compression: compression,
+		dataOffset:  w.offset,
+		rawSize:     rawSize,
+		storedSize:  storedSize,
+		checksum:    checksum,
+	})
+	w.names[name] = true
+
+	w.offset += storedSize
+	return nil
+}
+
+// AddFile reads a file from disk and adds it to the archive.
+func (w *PackWriter) AddFile(name string, srcPath string, opts EntryOpts) error {
+	data := os.ReadFile(srcPath)?
+	return w.Add(name, data, opts)
+}
+
+// Close finalizes the archive by writing the path pool, entry table, and footer.
+func (w *PackWriter) Close() error {
+	// Build path string pool
+	pathPool := make([]byte, 0)
+	pathOffsets := make([]uint32, len(w.entries))
+	pathLens := make([]uint16, len(w.entries))
+
+	for i, e := range w.entries {
+		if uint64(len(pathPool))+uint64(len(e.path)) > 0xFFFFFFFF {
+			fail errors.New("vopack: path pool exceeds uint32 limit")
+		}
+		pathOffsets[i] = uint32(len(pathPool))
+		pathLens[i] = uint16(len(e.path))
+		pathPool = append(pathPool, []byte(e.path)...)
+	}
+
+	errdefer w.file.Close()
+
+	// Write path pool
+	pathPoolOff := w.offset
+	w.file.Write(pathPool)?
+	w.offset += uint64(len(pathPool))
+
+	// Write entry table (batched into single write)
+	entryTableOff := w.offset
+	entryBuf := make([]byte, len(w.entries)*entrySize)
+	for i, e := range w.entries {
+		copy(entryBuf[i*entrySize:], marshalEntry(entry{
+			pathOffset:  pathOffsets[i],
+			pathLen:     pathLens[i],
+			compression: e.compression,
+			dataOffset:  e.dataOffset,
+			rawSize:     e.rawSize,
+			storedSize:  e.storedSize,
+			checksum:    e.checksum,
+		}))
+	}
+	w.file.Write(entryBuf)?
+	w.offset += uint64(len(entryBuf))
+
+	// Write footer
+	w.file.Write(marshalFooter(footer{
+		pathPoolOff:   pathPoolOff,
+		pathPoolSize:  uint64(len(pathPool)),
+		entryTableOff: entryTableOff,
+		entryCount:    uint32(len(w.entries)),
+	}))?
+	w.offset += footerSize
+
+	// Update file header with final data region size
+	w.file.WriteAt(marshalHeader(fileHeader{
+		dataOff:  headerSize,
+		dataSize: pathPoolOff - headerSize,
+	}), 0)?
+
+	return w.file.Close()
+}
