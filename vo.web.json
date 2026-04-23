@@ -1,0 +1,65 @@
+{
+  "artifacts": [],
+  "commit": "efa597ed7393c7707e390e82899730e6981d0536",
+  "extension": null,
+  "module": "github.com/vo-lang/vopack",
+  "module_root": ".",
+  "require": [],
+  "schema_version": 1,
+  "source": [
+    {
+      "digest": "sha256:9f5dc000448a9a2f01aac1a98de80a15650892e31f40aea25290d33b988d74e5",
+      "path": ".gitignore",
+      "size": 17
+    },
+    {
+      "digest": "sha256:5c86bf15e61604c087bf469ea6608ed398c1fca3080dfae4c8318863caee92ab",
+      "path": "compress.vo",
+      "size": 6800
+    },
+    {
+      "digest": "sha256:ebb3ef8e8cd31b38c5aebb1604bb20105f5bc7535b0076644b4071bb68970cb1",
+      "path": "format.vo",
+      "size": 7010
+    },
+    {
+      "digest": "sha256:664d007aba567c6166a295bf52c2a4d1dcddd5de32a6ee795e0b642a454efdab",
+      "path": "main.vo",
+      "size": 1408
+    },
+    {
+      "digest": "sha256:2e332e4a6cdb7312bcf70fcccafeab2694834848ed7de1ee021b89fa19d28649",
+      "path": "mount.vo",
+      "size": 3461
+    },
+    {
+      "digest": "sha256:f6effc79c175aa3468f0eb8288cd289fe82f522e27a1845ee2ff380b02699e71",
+      "path": "reader.vo",
+      "size": 5735
+    },
+    {
+      "digest": "sha256:9fb5989aaa56c46e32cae5492db1da53a19b5177cc6a45eafbb318c061708adc",
+      "path": "tests/main.vo",
+      "size": 14408
+    },
+    {
+      "digest": "sha256:34b434cc1613f4de7bcee50ed8d8896621e287ab5b93458bde9fa2139dccc3ba",
+      "path": "vo.lock",
+      "size": 98
+    },
+    {
+      "digest": "sha256:b61fee532e4c38a94fe1666974e173e983fc42d686d5b64f61f9620f457944d6",
+      "path": "vo.mod",
+      "size": 44
+    },
+    {
+      "digest": "sha256:b5411af8b022f22dbfca504ec18bcc64092129740b80e62eb82b87c61da1f4c3",
+      "path": "writer.vo",
+      "size": 5046
+    }
+  ],
+  "source_digest": "sha256:26cb1f966350318522517a02bbc36b37b02d4a0d68ef2a6f932ba809e9268d6a",
+  "version": "v0.1.0",
+  "vo": "^0.1.0",
+  "web": null
+}
