@@ -1,6 +1,6 @@
 {
   "artifacts": [],
-  "commit": "efa597ed7393c7707e390e82899730e6981d0536",
+  "commit": "d2063001e66405ad800bdabe0c7e7ff6343149de",
   "extension": null,
   "module": "github.com/vo-lang/vopack",
   "module_root": ".",
@@ -18,9 +18,9 @@
       "size": 6800
     },
     {
-      "digest": "sha256:ebb3ef8e8cd31b38c5aebb1604bb20105f5bc7535b0076644b4071bb68970cb1",
+      "digest": "sha256:e129f76111ee0ac8610e9df58687a961a32659f6375ae889409fe4b75d61a722",
       "path": "format.vo",
-      "size": 7010
+      "size": 7273
     },
     {
       "digest": "sha256:664d007aba567c6166a295bf52c2a4d1dcddd5de32a6ee795e0b642a454efdab",
@@ -28,19 +28,24 @@
       "size": 1408
     },
     {
-      "digest": "sha256:2e332e4a6cdb7312bcf70fcccafeab2694834848ed7de1ee021b89fa19d28649",
+      "digest": "sha256:fe5a159bcd53510ae3c334c64d0735ee9cc01d540cee74b2c932804aad9d96eb",
+      "path": "manifest.vo",
+      "size": 4064
+    },
+    {
+      "digest": "sha256:f1ccbe4dd8212b33cf7830acb6824b4c098520052aa0e96469fcf191a14bca29",
       "path": "mount.vo",
-      "size": 3461
+      "size": 4143
     },
     {
-      "digest": "sha256:f6effc79c175aa3468f0eb8288cd289fe82f522e27a1845ee2ff380b02699e71",
+      "digest": "sha256:8c8d20bb8ad8b939d97aa6583839f79f1540892a27ba1d6787354d9bc8f2dc4b",
       "path": "reader.vo",
-      "size": 5735
+      "size": 6557
     },
     {
-      "digest": "sha256:9fb5989aaa56c46e32cae5492db1da53a19b5177cc6a45eafbb318c061708adc",
+      "digest": "sha256:86f808aa72f4a2b14d9c0ee717f018e9b0be9e605423a1710ad568e6de7af4a9",
       "path": "tests/main.vo",
-      "size": 14408
+      "size": 18113
     },
     {
       "digest": "sha256:34b434cc1613f4de7bcee50ed8d8896621e287ab5b93458bde9fa2139dccc3ba",
@@ -53,13 +58,13 @@
       "size": 44
     },
     {
-      "digest": "sha256:b5411af8b022f22dbfca504ec18bcc64092129740b80e62eb82b87c61da1f4c3",
+      "digest": "sha256:029284403c8a4535c252b4578fd49fcf913da08d322105b43ecd1686c5aaeabd",
       "path": "writer.vo",
-      "size": 5046
+      "size": 6536
     }
   ],
-  "source_digest": "sha256:26cb1f966350318522517a02bbc36b37b02d4a0d68ef2a6f932ba809e9268d6a",
-  "version": "v0.1.0",
+  "source_digest": "sha256:17fd93212925aa8c1c0d27b60a1673df27de023b5f712a80051355dd961e4258",
+  "version": "v0.1.2",
   "vo": "^0.1.0",
   "web": null
 }

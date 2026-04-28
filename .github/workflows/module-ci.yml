@@ -60,8 +60,10 @@ jobs:
 
       - name: Stage release assets
         run: |
+          SOURCE_COMMIT="$(node -e "console.log(JSON.parse(require('fs').readFileSync('vo.web.json', 'utf8')).commit)")"
           vo release stage . \
             --version "${{ inputs.version || github.event.release.tag_name || github.ref_name }}" \
+            --commit "$SOURCE_COMMIT" \
             --out-dir release-dist
 
       - name: Upload release assets
