@@ -17,8 +17,10 @@ import (
 
 // EntryOpts controls per-entry options when adding resources.
 type EntryOpts struct {
-	Compression uint8  // CompressNone or CompressLZ4
-	Alignment   uint32 // 0 = default (16 bytes); otherwise must be a power of two
+	Compression  uint8    // CompressNone or CompressLZ4
+	Alignment    uint32   // 0 = default (16 bytes); otherwise must be a power of two
+	Type         string   // optional manifest asset type; inferred from path when empty
+	Dependencies []string // optional manifest dependency paths
 }
 
 // writerEntry stores metadata collected during writing.
@@ -29,14 +31,18 @@ type writerEntry struct {
 	rawSize     uint64
 	storedSize  uint64
 	checksum    uint32
+	manifest    ManifestAsset
 }
 
 // PackWriter writes resources into a .vpak archive.
 type PackWriter struct {
-	file    *os.File
-	offset  uint64       // current write position in the file
-	entries []writerEntry
-	names   map[string]bool
+	file        *os.File
+	offset      uint64       // current write position in the file
+	entries     []writerEntry
+	names       map[string]bool
+	packName    string
+	packVersion string
+	closing     bool
 }
 
 // Create opens a new .vpak file for writing.
@@ -57,6 +63,11 @@ func Create(path string) (*PackWriter, error) {
 	}, nil
 }
 
+func (w *PackWriter) SetManifestInfo(packName, packVersion string) {
+	w.packName = packName
+	w.packVersion = packVersion
+}
+
 // Add writes a resource from a byte slice into the archive.
 //
 // The archive preserves insertion order for listing, but duplicate paths are
@@ -64,6 +75,9 @@ func Create(path string) (*PackWriter, error) {
 func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
 	if w.names[name] {
 		fail errors.New("vopack: duplicate resource path: " + name)
+	}
+	if name == ManifestPath && !w.closing {
+		fail errors.New("vopack: manifest path is reserved: " + name)
 	}
 	if len(name) > 0xFFFF {
 		fail errors.New("vopack: resource path too long: " + name)
@@ -116,6 +130,12 @@ func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
 		rawSize:     rawSize,
 		storedSize:  storedSize,
 		checksum:    checksum,
+		manifest: ManifestAsset{
+			Path:         name,
+			Type:         normalizeManifestAssetType(opts.Type, name),
+			ContentHash:  manifestHash(data),
+			Dependencies: cloneStringSlice(opts.Dependencies),
+		},
 	})
 	w.names[name] = true
 
@@ -126,11 +146,33 @@ func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
 // AddFile reads a file from disk and adds it to the archive.
 func (w *PackWriter) AddFile(name string, srcPath string, opts EntryOpts) error {
 	data := os.ReadFile(srcPath)?
-	return w.Add(name, data, opts)
+	err := w.Add(name, data, opts)
+	if err != nil {
+		return err
+	}
+	w.entries[len(w.entries)-1].manifest.SourcePath = srcPath
+	return nil
 }
 
 // Close finalizes the archive by writing the path pool, entry table, and footer.
 func (w *PackWriter) Close() error {
+	w.closing = true
+	if !w.names[ManifestPath] {
+		manifest := NewManifest(w.packName, w.packVersion)
+		for _, e := range w.entries {
+			if e.path != ManifestPath {
+				manifest.Assets = append(manifest.Assets, e.manifest)
+			}
+		}
+		data, err := marshalManifest(manifest)
+		if err != nil {
+			return err
+		}
+		if err := w.Add(ManifestPath, data, EntryOpts{Type: "manifest"}); err != nil {
+			return err
+		}
+	}
+
 	// Build path string pool
 	pathPool := make([]byte, 0)
 	pathOffsets := make([]uint32, len(w.entries))
@@ -185,4 +227,20 @@ func (w *PackWriter) Close() error {
 	}), 0)?
 
 	return w.file.Close()
+}
+
+func normalizeManifestAssetType(kind, path string) string {
+	if kind != "" {
+		return kind
+	}
+	return inferAssetType(path)
+}
+
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	out := make([]string, len(values))
+	copy(out, values)
+	return out
 }

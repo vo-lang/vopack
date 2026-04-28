@@ -74,6 +74,32 @@ func (m *MountSet) Read(name string) ([]byte, error) {
 	return nil, errors.New("vopack: resource not found in any mount: " + name)
 }
 
+func (m *MountSet) ManifestFor(name string) (*Manifest, error) {
+	for _, me := range m.mounts {
+		if me.reader.Has(name) {
+			return me.reader.Manifest()
+		}
+	}
+	return nil, errors.New("vopack: resource not found in any mount: " + name)
+}
+
+func (m *MountSet) VerifyManifestDependencies(requester string) error {
+	if requester == "" {
+		for _, me := range m.mounts {
+			if err := me.reader.VerifyManifestDependencies(""); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, me := range m.mounts {
+		if me.reader.Has(requester) {
+			return me.reader.VerifyManifestDependencies(requester)
+		}
+	}
+	return errors.New("vopack: requester not found in any mount: " + requester)
+}
+
 // Has returns true if any mounted archive contains the resource.
 func (m *MountSet) Has(name string) bool {
 	for _, me := range m.mounts {

@@ -19,6 +19,21 @@ func mustReadFile(path string) []byte {
 	return data
 }
 
+func contains(s, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	if len(needle) > len(s) {
+		return false
+	}
+	for i := 0; i <= len(s)-len(needle); i++ {
+		if s[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
 func entryTableOffset(data []byte) int {
 	footerOff := len(data) - 32
 	return int(binary.LittleEndian.Uint64(data[footerOff+16 : footerOff+24]))
@@ -83,6 +98,8 @@ func main() {
 	testRejectUncompressedSizeMismatch(tmpDir)
 	testRejectCorruptReservedEntryBytes(tmpDir)
 	testListPrefix(tmpDir)
+	testManifest(tmpDir)
+	testManifestDependencies(tmpDir)
 	testMountOverlay(tmpDir)
 	testEmptyArchive(tmpDir)
 	testAlignmentLayout(tmpDir)
@@ -332,6 +349,75 @@ func testListPrefix(tmpDir string) {
 
 	err = r.Close()
 	assert(err == nil, "close list reader")
+}
+
+func testManifest(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "manifest.vpak"})
+
+	w, err := vopack.Create(path)
+	assert(err == nil, "create manifest archive")
+	w.SetManifestInfo("test-pack", "1.2.3")
+	srcPath := filepath.Join([]string{tmpDir, "road.png"})
+	err = os.WriteFile(srcPath, []byte("road-texture"), 0644)
+	assert(err == nil, "write manifest source")
+	err = w.AddFile("textures/road.png", srcPath, vopack.EntryOpts{Type: "texture"})
+	assert(err == nil, "add manifest texture")
+	err = w.Close()
+	assert(err == nil, "close manifest archive")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open manifest archive")
+	assert(r.Len() == 1, "manifest metadata should not count as resource")
+	assert(!r.Has(vopack.ManifestPath), "manifest metadata should not be a public resource")
+	manifest, err := r.Manifest()
+	assert(err == nil, "read manifest")
+	assert(manifest.PackName == "test-pack", "manifest pack name")
+	assert(manifest.PackVersion == "1.2.3", "manifest pack version")
+	assert(len(manifest.Assets) == 1, "manifest asset count")
+	assert(manifest.Assets[0].Path == "textures/road.png", "manifest asset path")
+	assert(manifest.Assets[0].Type == "texture", "manifest asset type")
+	assert(manifest.Assets[0].ContentHash != "", "manifest asset hash")
+	assert(manifest.Assets[0].SourcePath != "", "manifest source path")
+	_, err = r.Read(vopack.ManifestPath)
+	assert(err != nil, "manifest should not read as normal resource")
+	err = r.Close()
+	assert(err == nil, "close manifest reader")
+}
+
+func testManifestDependencies(tmpDir string) {
+	path := filepath.Join([]string{tmpDir, "manifest-deps.vpak"})
+	w, err := vopack.Create(path)
+	assert(err == nil, "create manifest deps archive")
+	err = w.Add("tracks/main/track.json", []byte("{}"), vopack.EntryOpts{Type: "track", Dependencies: []string{"tracks/main/road.glb", "tracks/main/road.png"}})
+	assert(err == nil, "add track with deps")
+	err = w.Add("tracks/main/road.glb", []byte("road"), vopack.EntryOpts{Type: "model", Dependencies: []string{"tracks/main/road.png"}})
+	assert(err == nil, "add road model with deps")
+	err = w.Add("tracks/main/road.png", []byte("texture"), vopack.EntryOpts{Type: "texture"})
+	assert(err == nil, "add road texture")
+	err = w.Close()
+	assert(err == nil, "close manifest deps archive")
+
+	r, err := vopack.Open(path)
+	assert(err == nil, "open manifest deps archive")
+	err = r.VerifyManifestDependencies("tracks/main/track.json")
+	assert(err == nil, "verify manifest deps")
+	err = r.Close()
+	assert(err == nil, "close manifest deps reader")
+
+	broken := filepath.Join([]string{tmpDir, "manifest-deps-broken.vpak"})
+	w, err = vopack.Create(broken)
+	assert(err == nil, "create broken manifest deps archive")
+	err = w.Add("tracks/main/track.json", []byte("{}"), vopack.EntryOpts{Type: "track", Dependencies: []string{"tracks/main/missing.glb"}})
+	assert(err == nil, "add broken track")
+	err = w.Close()
+	assert(err == nil, "close broken manifest deps archive")
+	r, err = vopack.Open(broken)
+	assert(err == nil, "open broken manifest deps archive")
+	err = r.VerifyManifestDependencies("tracks/main/track.json")
+	assert(err != nil, "missing manifest dependency should fail")
+	assert(contains(err.Error(), "tracks/main/track.json") && contains(err.Error(), "tracks/main/missing.glb"), "dependency error includes requester and missing path")
+	err = r.Close()
+	assert(err == nil, "close broken manifest deps reader")
 }
 
 func testMountOverlay(tmpDir string) {

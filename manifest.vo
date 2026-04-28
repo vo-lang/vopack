@@ -1,0 +1,167 @@
+package vopack
+
+import (
+	"encoding/json"
+	"errors"
+	"strconv"
+)
+
+const ManifestPath = ".vopack/manifest.json"
+
+type Manifest struct {
+	FormatVersion int             `json:"formatVersion"`
+	PackName      string          `json:"packName,omitempty"`
+	PackVersion   string          `json:"packVersion,omitempty"`
+	Assets        []ManifestAsset `json:"assets"`
+}
+
+type ManifestAsset struct {
+	Path         string   `json:"path"`
+	Type         string   `json:"type,omitempty"`
+	ContentHash  string   `json:"contentHash"`
+	SourcePath   string   `json:"sourcePath,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
+}
+
+func NewManifest(packName, packVersion string) Manifest {
+	return Manifest{
+		FormatVersion: 1,
+		PackName:      packName,
+		PackVersion:   packVersion,
+		Assets:        []ManifestAsset{},
+	}
+}
+
+func (m *Manifest) Find(path string) *ManifestAsset {
+	if m == nil {
+		return nil
+	}
+	for i := range m.Assets {
+		if m.Assets[i].Path == path {
+			return &m.Assets[i]
+		}
+	}
+	return nil
+}
+
+func marshalManifest(m Manifest) ([]byte, error) {
+	if m.FormatVersion == 0 {
+		m.FormatVersion = 1
+	}
+	if m.Assets == nil {
+		m.Assets = []ManifestAsset{}
+	}
+	return json.MarshalIndent(m, "", "  ")
+}
+
+func unmarshalManifest(data []byte) (*Manifest, error) {
+	var manifest Manifest
+	json.Unmarshal(data, &manifest)?
+	if manifest.FormatVersion != 1 {
+		fail errors.New("vopack: unsupported manifest version: " + strconv.Itoa(manifest.FormatVersion))
+	}
+	if manifest.Assets == nil {
+		manifest.Assets = []ManifestAsset{}
+	}
+	return &manifest, nil
+}
+
+func verifyManifestDependencies(manifest *Manifest, exists func(string) bool, requester string) error {
+	if manifest == nil {
+		fail errors.New("vopack: manifest is nil")
+	}
+	if exists == nil {
+		fail errors.New("vopack: manifest verifier missing exists function")
+	}
+	declared := map[string]*ManifestAsset{}
+	for i := range manifest.Assets {
+		asset := &manifest.Assets[i]
+		if asset.Path == "" {
+			fail errors.New("vopack: manifest asset path must not be empty")
+		}
+		if declared[asset.Path] != nil {
+			fail errors.New("vopack: duplicate manifest asset: " + asset.Path)
+		}
+		declared[asset.Path] = asset
+		if !exists(asset.Path) {
+			fail errors.New("vopack: manifest asset missing payload: " + asset.Path)
+		}
+	}
+	if requester != "" {
+		asset := declared[requester]
+		if asset == nil {
+			fail errors.New("vopack: manifest requester not found: " + requester)
+		}
+		return verifyManifestAssetDependencies(declared, exists, requester, asset)
+	}
+	for _, asset := range manifest.Assets {
+		if err := verifyManifestAssetDependencies(declared, exists, asset.Path, &asset); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyManifestAssetDependencies(declared map[string]*ManifestAsset, exists func(string) bool, requester string, asset *ManifestAsset) error {
+	for _, dep := range asset.Dependencies {
+		if dep == "" {
+			fail errors.New("vopack: empty dependency for requester: " + requester)
+		}
+		if declared[dep] == nil || !exists(dep) {
+			fail errors.New("vopack: missing dependency for requester " + requester + ": " + dep)
+		}
+	}
+	return nil
+}
+
+func manifestHash(data []byte) string {
+	return "crc32:" + padHex8(strconv.FormatUint(uint(crc32(data)), 16))
+}
+
+func padHex8(s string) string {
+	for len(s) < 8 {
+		s = "0" + s
+	}
+	return s
+}
+
+func inferAssetType(path string) string {
+	ext := pathExtLower(path)
+	if ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp" {
+		return "texture"
+	}
+	if ext == ".glb" || ext == ".gltf" || ext == ".obj" {
+		return "model"
+	}
+	if ext == ".wav" || ext == ".ogg" || ext == ".mp3" {
+		return "audio"
+	}
+	if ext == ".json" {
+		return "json"
+	}
+	return "bytes"
+}
+
+func pathExtLower(path string) string {
+	start := -1
+	for i := len(path) - 1; i >= 0; i-- {
+		c := path[i]
+		if c == '/' || c == '\\' {
+			break
+		}
+		if c == '.' {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return ""
+	}
+	ext := []byte(path[start:])
+	for i := 0; i < len(ext); i++ {
+		if ext[i] >= 'A' && ext[i] <= 'Z' {
+			ext[i] += 'a' - 'A'
+		}
+	}
+	return string(ext)
+}
