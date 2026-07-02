@@ -33,8 +33,15 @@ func NewMountSet() *MountSet {
 
 // Mount opens and registers an archive at the given priority.
 // Higher priority archives are searched first, and equal priorities preserve
-// mount order.
+// mount order. Mounting the same archive at the same priority is idempotent;
+// callers that rebuild game state can safely reassert a base asset pack
+// without leaking readers or changing overlay precedence.
 func (m *MountSet) Mount(path string, priority int) error {
+	for _, me := range m.mounts {
+		if me.path == path && me.priority == priority {
+			return nil
+		}
+	}
 	r := Open(path)?
 	m.mounts = append(m.mounts, mountEntry{
 		path:     path,
@@ -50,6 +57,14 @@ func (m *MountSet) Mount(path string, priority int) error {
 		}
 	}
 	return nil
+}
+
+// Count returns the number of mounted archives.
+func (m *MountSet) Count() int {
+	if m == nil {
+		return 0
+	}
+	return len(m.mounts)
 }
 
 // Unmount removes and closes the archive at the given path.
