@@ -9,26 +9,23 @@ import (
 const ManifestPath = ".vopack/manifest.json"
 
 type Manifest struct {
-	FormatVersion int             `json:"formatVersion"`
-	PackName      string          `json:"packName,omitempty"`
-	PackVersion   string          `json:"packVersion,omitempty"`
-	Assets        []ManifestAsset `json:"assets"`
+	FormatVersion int `json:"formatVersion"`
+	PackName string `json:"packName,omitempty"`
+	PackVersion string `json:"packVersion,omitempty"`
+	Assets []ManifestAsset `json:"assets"`
 }
 
 type ManifestAsset struct {
-	Path         string   `json:"path"`
-	Type         string   `json:"type,omitempty"`
-	ContentHash  string   `json:"contentHash"`
-	SourcePath   string   `json:"sourcePath,omitempty"`
+	Path string `json:"path"`
+	Type string `json:"type,omitempty"`
+	ContentHash string `json:"contentHash"`
+	SourcePath string `json:"sourcePath,omitempty"`
 	Dependencies []string `json:"dependencies,omitempty"`
 }
 
 func NewManifest(packName, packVersion string) Manifest {
 	return Manifest{
-		FormatVersion: 1,
-		PackName:      packName,
-		PackVersion:   packVersion,
-		Assets:        []ManifestAsset{},
+		FormatVersion: 1, PackName: packName, PackVersion: packVersion, Assets: []ManifestAsset{},
 	}
 }
 
@@ -115,7 +112,7 @@ func verifyManifestAssetDependencies(declared map[string]*ManifestAsset, exists 
 }
 
 func manifestHash(data []byte) string {
-	return "crc32:" + padHex8(strconv.FormatUint(uint(crc32(data)), 16))
+	return "crc32:" + padHex8(strconv.FormatUint(uint64(crc32(data)), 16))
 }
 
 func padHex8(s string) string {
