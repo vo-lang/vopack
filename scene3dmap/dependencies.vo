@@ -1,0 +1,74 @@
+package scene3dmap
+
+import (
+	"path/filepath"
+)
+
+// Dependencies returns the map's complete direct resource closure in stable
+// wire order. Repeated paths keep the kind of their first declaration.
+func Dependencies(asset *Asset, baseDir string) []Dependency {
+	deps := []Dependency{}
+	seen := map[string]bool{}
+	if asset == nil {
+		return deps
+	}
+	if asset.Terrain != nil {
+		terrain := asset.Terrain
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.Heightmap), "terrain-heightmap")
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.Texture), "terrain-texture")
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.Normal), "terrain-normal")
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.MetallicRoughness), "terrain-metallic-roughness")
+		deps = appendSplatDependencies(deps, seen, baseDir, terrain.Splat)
+	}
+	for _, mesh := range asset.Meshes {
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, mesh.Model), "mesh-model")
+		for _, lod := range mesh.LodLevels {
+			deps = appendDependency(deps, seen, ResolvePath(baseDir, lod.Model), "mesh-lod-model")
+		}
+	}
+	for _, terrain := range asset.MeshTerrains {
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.Model), "mesh-terrain-model")
+		for _, lod := range terrain.LodLevels {
+			deps = appendDependency(deps, seen, ResolvePath(baseDir, lod.Model), "mesh-terrain-lod-model")
+		}
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, terrain.HeightGrid), "mesh-terrain-height-grid")
+		deps = appendSplatDependencies(deps, seen, baseDir, terrain.Splat)
+	}
+	for _, layer := range asset.PrimitiveLayers {
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, layer.Source), "primitive-layer")
+	}
+	return deps
+}
+
+// ResolvePath resolves a map-relative resource while preserving empty and
+// absolute paths exactly.
+func ResolvePath(baseDir, child string) string {
+	if child == "" || filepath.IsAbs(child) {
+		return child
+	}
+	if baseDir == "" || baseDir == "." {
+		return child
+	}
+	return filepath.Join(baseDir, child)
+}
+
+func appendSplatDependencies(deps []Dependency, seen map[string]bool, baseDir string, splat *TerrainSplat) []Dependency {
+	if splat == nil {
+		return deps
+	}
+	deps = appendDependency(deps, seen, ResolvePath(baseDir, splat.Control), "terrain-splat-control")
+	for _, layer := range splat.Layers {
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, layer.Texture), "terrain-splat-texture")
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, layer.Normal), "terrain-splat-normal")
+		deps = appendDependency(deps, seen, ResolvePath(baseDir, layer.MetallicRoughness), "terrain-splat-metallic-roughness")
+	}
+	return deps
+}
+
+func appendDependency(deps []Dependency, seen map[string]bool, path, kind string) []Dependency {
+	if path == "" || seen[path] {
+		return deps
+	}
+	seen[path] = true
+	return append(deps, Dependency{Path: path, Kind: kind})
+}

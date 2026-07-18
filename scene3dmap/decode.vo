@@ -1,0 +1,375 @@
+package scene3dmap
+
+import (
+	"bytes"
+	"dyn"
+	"encoding/json"
+	"sort"
+	"strconv"
+)
+
+var assetFields = map[string]bool{
+	"version": true, "name": true, "terrain": true, "meshes": true, "meshTerrains": true,
+	"primitiveLayers": true, "spawns": true,
+}
+
+var terrainFields = map[string]bool{
+	"heightmap": true, "texture": true, "normal": true, "metallicRoughness": true, "splat": true,
+	"position": true, "width": true, "height": true, "depth": true, "uvScale": true,
+	"normalScale": true, "roughness": true, "metallic": true, "tint": true, "tintSet": true,
+	"tag": true, "friction": true, "cullDistance": true, "cullRadius": true, "frustumCull": true,
+}
+
+var terrainSplatFields = map[string]bool{"control": true, "layers": true, "tuning": true}
+
+var terrainSplatLayerFields = map[string]bool{
+	"texture": true, "normal": true, "metallicRoughness": true, "uvScale": true, "normalScale": true,
+}
+
+var terrainMaterialTuningFields = map[string]bool{
+	"macroScale": true, "macroStrength": true, "detailNear": true, "detailFar": true,
+	"slopeStart": true, "slopeEnd": true, "slopeDirtStrength": true, "slopeRockStrength": true,
+	"antiTileStrength": true, "detailStrength": true, "normalNear": true, "normalFar": true,
+	"heightBlendStrength": true, "heightLow": true, "heightHigh": true, "curvatureStrength": true,
+}
+
+var materialFields = map[string]bool{
+	"baseColor": true, "baseColorSet": true, "roughness": true, "metallic": true, "normalScale": true,
+	"uvScale": true, "detailStrength": true, "macroBlend": true, "roughnessResponse": true,
+	"toonRampResponse": true, "shadingMode": true, "wrapMode": true, "filterMode": true,
+}
+
+var vec3Fields = map[string]bool{"x": true, "y": true, "z": true}
+
+var colorFields = map[string]bool{"r": true, "g": true, "b": true, "a": true}
+
+var meshFields = map[string]bool{
+	"name": true, "model": true, "lodLevels": true, "collision": true, "hidden": true,
+	"position": true, "rotation": true, "scale": true, "material": true, "tint": true, "tintSet": true,
+	"pickMode": true, "friction": true, "cullDistance": true, "cullRadius": true, "frustumCull": true,
+}
+
+var meshLodLevelFields = map[string]bool{"model": true, "distance": true}
+
+var meshTerrainFields = map[string]bool{
+	"name": true, "model": true, "lodLevels": true, "heightGrid": true, "splat": true,
+	"material": true, "pickMode": true, "tag": true, "cullDistance": true, "cullRadius": true,
+	"frustumCull": true,
+}
+
+var primitiveLayerFields = map[string]bool{
+	"name": true, "source": true, "kind": true, "chunkCellSize": true, "preloadChunks": true,
+	"slots": true,
+}
+
+var spawnFields = map[string]bool{"name": true, "position": true, "yaw": true}
+
+// Decode parses one complete Scene3D map document. It rejects trailing JSON,
+// non-object roots, unknown members at every schema depth, type mismatches,
+// and unsupported format versions before returning an Asset.
+func Decode(data []byte) (*Asset, error) {
+	if err := rejectDuplicateFields(data); err != nil {
+		return nil, err
+	}
+	value, err := json.Decode(data)
+	if err != nil {
+		return nil, invalid("decode JSON: " + err.Error())
+	}
+	validateWireShape(value)?
+	var asset Asset
+	if err := json.Unmarshal(data, &asset); err != nil {
+		return nil, invalid("decode fields: " + err.Error())
+	}
+	Validate(&asset)?
+	return &asset, nil
+}
+
+func rejectDuplicateFields(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return invalid("decode JSON: " + err.Error())
+	}
+	return scanUniqueFields(decoder, token, "$")
+}
+
+func scanUniqueFields(decoder *json.Decoder, token json.Token, path string) error {
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if delim == '{' {
+		seen := map[string]bool{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return invalid("decode JSON: " + err.Error())
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return invalid(path + " contains a non-string field name")
+			}
+			if seen[key] {
+				return invalid(path + ": duplicate field " + key)
+			}
+			seen[key] = true
+			valueToken, valueErr := decoder.Token()
+			if valueErr != nil {
+				return invalid("decode JSON: " + valueErr.Error())
+			}
+			scanUniqueFields(decoder, valueToken, path + "." + key)?
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return invalid("decode JSON: " + err.Error())
+		}
+		endDelim, ok := end.(json.Delim)
+		if !ok || endDelim != '}' {
+			return invalid(path + " has an invalid object terminator")
+		}
+		return nil
+	}
+	if delim == '[' {
+		index := 0
+		for decoder.More() {
+			valueToken, err := decoder.Token()
+			if err != nil {
+				return invalid("decode JSON: " + err.Error())
+			}
+			scanUniqueFields(decoder, valueToken, path + "[" + strconv.Itoa(index) + "]")?
+			index++
+		}
+		end, err := decoder.Token()
+		if err != nil {
+			return invalid("decode JSON: " + err.Error())
+		}
+		endDelim, ok := end.(json.Delim)
+		if !ok || endDelim != ']' {
+			return invalid(path + " has an invalid array terminator")
+		}
+		return nil
+	}
+	return invalid(path + " has an unexpected JSON delimiter")
+}
+
+func validateWireShape(value any) error {
+	root, ok := value.(dyn.MapObject)
+	if !ok {
+		return invalid("$ must be an object")
+	}
+	validateObjectFields(root, "$", assetFields)?
+	terrain, err := objectMember(root, "terrain", "$.terrain", true)
+	if err != nil {
+		return err
+	}
+	if terrain != nil {
+		validateTerrainObject(terrain, "$.terrain")?
+	}
+	meshes, err := objectArrayMember(root, "meshes", "$.meshes")
+	if err != nil {
+		return err
+	}
+	for i, mesh := range meshes {
+		validateMeshObject(mesh, "$.meshes[" + strconv.Itoa(i) + "]")?
+	}
+	meshTerrains, err := objectArrayMember(root, "meshTerrains", "$.meshTerrains")
+	if err != nil {
+		return err
+	}
+	for i, terrain := range meshTerrains {
+		validateMeshTerrainObject(terrain, "$.meshTerrains[" + strconv.Itoa(i) + "]")?
+	}
+	primitiveLayers, err := objectArrayMember(root, "primitiveLayers", "$.primitiveLayers")
+	if err != nil {
+		return err
+	}
+	for i, layer := range primitiveLayers {
+		validateObjectFields(layer, "$.primitiveLayers[" + strconv.Itoa(i) + "]", primitiveLayerFields)?
+	}
+	spawns, err := objectArrayMember(root, "spawns", "$.spawns")
+	if err != nil {
+		return err
+	}
+	for i, spawn := range spawns {
+		path := "$.spawns[" + strconv.Itoa(i) + "]"
+		validateObjectFields(spawn, path, spawnFields)?
+		position, positionErr := objectMember(spawn, "position", path + ".position", false)
+		if positionErr != nil {
+			return positionErr
+		}
+		if position != nil {
+			validateObjectFields(position, path + ".position", vec3Fields)?
+		}
+	}
+	return nil
+}
+
+func validateTerrainObject(terrain dyn.MapObject, path string) error {
+	validateObjectFields(terrain, path, terrainFields)?
+	position, err := objectMember(terrain, "position", path + ".position", false)
+	if err != nil {
+		return err
+	}
+	if position != nil {
+		validateObjectFields(position, path + ".position", vec3Fields)?
+	}
+	tint, err := objectMember(terrain, "tint", path + ".tint", false)
+	if err != nil {
+		return err
+	}
+	if tint != nil {
+		validateObjectFields(tint, path + ".tint", colorFields)?
+	}
+	splat, err := objectMember(terrain, "splat", path + ".splat", true)
+	if err != nil {
+		return err
+	}
+	if splat != nil {
+		validateTerrainSplatObject(splat, path + ".splat")?
+	}
+	return nil
+}
+
+func validateTerrainSplatObject(splat dyn.MapObject, path string) error {
+	validateObjectFields(splat, path, terrainSplatFields)?
+	layers, err := objectArrayMember(splat, "layers", path + ".layers")
+	if err != nil {
+		return err
+	}
+	for i, layer := range layers {
+		validateObjectFields(layer, path + ".layers[" + strconv.Itoa(i) + "]", terrainSplatLayerFields)?
+	}
+	tuning, err := objectMember(splat, "tuning", path + ".tuning", false)
+	if err != nil {
+		return err
+	}
+	if tuning != nil {
+		validateObjectFields(tuning, path + ".tuning", terrainMaterialTuningFields)?
+	}
+	return nil
+}
+
+func validateMeshObject(mesh dyn.MapObject, path string) error {
+	validateObjectFields(mesh, path, meshFields)?
+	lods, err := objectArrayMember(mesh, "lodLevels", path + ".lodLevels")
+	if err != nil {
+		return err
+	}
+	for i, lod := range lods {
+		validateObjectFields(lod, path + ".lodLevels[" + strconv.Itoa(i) + "]", meshLodLevelFields)?
+	}
+	for _, field := range []string{"position", "rotation", "scale"} {
+		value, valueErr := objectMember(mesh, field, path + "." + field, false)
+		if valueErr != nil {
+			return valueErr
+		}
+		if value != nil {
+			validateObjectFields(value, path + "." + field, vec3Fields)?
+		}
+	}
+	material, err := objectMember(mesh, "material", path + ".material", false)
+	if err != nil {
+		return err
+	}
+	if material != nil {
+		validateMaterialObject(material, path + ".material")?
+	}
+	tint, err := objectMember(mesh, "tint", path + ".tint", false)
+	if err != nil {
+		return err
+	}
+	if tint != nil {
+		validateObjectFields(tint, path + ".tint", colorFields)?
+	}
+	return nil
+}
+
+func validateMeshTerrainObject(terrain dyn.MapObject, path string) error {
+	validateObjectFields(terrain, path, meshTerrainFields)?
+	lods, err := objectArrayMember(terrain, "lodLevels", path + ".lodLevels")
+	if err != nil {
+		return err
+	}
+	for i, lod := range lods {
+		validateObjectFields(lod, path + ".lodLevels[" + strconv.Itoa(i) + "]", meshLodLevelFields)?
+	}
+	splat, err := objectMember(terrain, "splat", path + ".splat", true)
+	if err != nil {
+		return err
+	}
+	if splat != nil {
+		validateTerrainSplatObject(splat, path + ".splat")?
+	}
+	material, err := objectMember(terrain, "material", path + ".material", false)
+	if err != nil {
+		return err
+	}
+	if material != nil {
+		validateMaterialObject(material, path + ".material")?
+	}
+	return nil
+}
+
+func validateMaterialObject(material dyn.MapObject, path string) error {
+	validateObjectFields(material, path, materialFields)?
+	baseColor, err := objectMember(material, "baseColor", path + ".baseColor", false)
+	if err != nil {
+		return err
+	}
+	if baseColor != nil {
+		validateObjectFields(baseColor, path + ".baseColor", colorFields)?
+	}
+	return nil
+}
+
+func validateObjectFields(object dyn.MapObject, path string, allowed map[string]bool) error {
+	unknown := []string{}
+	for field := range object {
+		if !allowed[field] {
+			unknown = append(unknown, field)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	return invalid(path + ": unknown field " + unknown[0])
+}
+
+func objectMember(parent dyn.MapObject, key, path string, nullable bool) (dyn.MapObject, error) {
+	value, ok := parent[key]
+	if !ok {
+		return nil, nil
+	}
+	if value == nil {
+		if nullable {
+			return nil, nil
+		}
+		return nil, invalid(path + " must be an object")
+	}
+	object, ok := value.(dyn.MapObject)
+	if !ok {
+		return nil, invalid(path + " must be an object")
+	}
+	return object, nil
+}
+
+func objectArrayMember(parent dyn.MapObject, key, path string) ([]dyn.MapObject, error) {
+	value, ok := parent[key]
+	if !ok || value == nil {
+		return nil, nil
+	}
+	values, ok := value.(dyn.SliceObject)
+	if !ok {
+		return nil, invalid(path + " must be an array")
+	}
+	objects := make([]dyn.MapObject, 0, len(values))
+	for i, value := range values {
+		object, ok := value.(dyn.MapObject)
+		if !ok {
+			return nil, invalid(path + "[" + strconv.Itoa(i) + "] must be an object")
+		}
+		objects = append(objects, object)
+	}
+	return objects, nil
+}

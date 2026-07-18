@@ -101,7 +101,7 @@ func (m *MountSet) ManifestFor(name string) (*Manifest, error) {
 func (m *MountSet) VerifyManifestDependencies(requester string) error {
 	if requester == "" {
 		for _, me := range m.mounts {
-			if err := me.reader.VerifyManifestDependencies(""); err != nil {
+			if err := me.reader.VerifyManifest(); err != nil {
 				return err
 			}
 		}

@@ -17,32 +17,33 @@ import (
 
 // EntryOpts controls per-entry options when adding resources.
 type EntryOpts struct {
-	Compression  uint8    // CompressNone or CompressLZ4
-	Alignment    uint32   // 0 = default (16 bytes); otherwise must be a power of two
-	Type         string   // optional manifest asset type; inferred from path when empty
+	Compression uint8 // CompressNone or CompressLZ4
+	Alignment uint32 // 0 = default (16 bytes); otherwise must be a power of two
+	Type string // optional manifest asset type; inferred from path when empty
 	Dependencies []string // optional manifest dependency paths
 }
 
 // writerEntry stores metadata collected during writing.
 type writerEntry struct {
-	path        string
+	path string
 	compression uint8
-	dataOffset  uint64
-	rawSize     uint64
-	storedSize  uint64
-	checksum    uint32
-	manifest    ManifestAsset
+	dataOffset uint64
+	rawSize uint64
+	storedSize uint64
+	checksum uint32
+	manifest ManifestAsset
 }
 
 // PackWriter writes resources into a .vpak archive.
 type PackWriter struct {
-	file        *os.File
-	offset      uint64       // current write position in the file
-	entries     []writerEntry
-	names       map[string]bool
-	packName    string
+	file *os.File
+	offset uint64 // current write position in the file
+	entries []writerEntry
+	names map[string]bool
+	packName string
 	packVersion string
-	closing     bool
+	closing bool
+	closed bool
 }
 
 // Create opens a new .vpak file for writing.
@@ -51,15 +52,10 @@ type PackWriter struct {
 func Create(path string) (*PackWriter, error) {
 	file := os.Create(path)?
 	errdefer file.Close()
-
 	// Write placeholder header (will be updated on Close)
 	file.Write(marshalHeader(fileHeader{dataOff: headerSize}))?
-
 	return &PackWriter{
-		file:    file,
-		offset:  headerSize,
-		entries: make([]writerEntry, 0),
-		names:   make(map[string]bool),
+		file: file, offset: headerSize, entries: make([]writerEntry, 0), names: make(map[string]bool),
 	}, nil
 }
 
@@ -73,38 +69,41 @@ func (w *PackWriter) SetManifestInfo(packName, packVersion string) {
 // The archive preserves insertion order for listing, but duplicate paths are
 // rejected so lookup and listing remain consistent.
 func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
+	if w.closed {
+		fail errors.New("vopack: writer is closed")
+	}
+	if err := validatePortablePath(name, w.closing); err != nil {
+		return err
+	}
 	if w.names[name] {
 		fail errors.New("vopack: duplicate resource path: " + name)
 	}
-	if name == ManifestPath && !w.closing {
-		fail errors.New("vopack: manifest path is reserved: " + name)
+	if conflict := conflictingPortablePath(w.names, name); conflict != "" {
+		fail errors.New("vopack: file/directory path collision: " + conflict + " and " + name)
 	}
-	if len(name) > 0xFFFF {
-		fail errors.New("vopack: resource path too long: " + name)
+	dependencies, err := canonicalDependencyList(name, opts.Dependencies)
+	if err != nil {
+		return err
 	}
-
 	alignment := opts.Alignment
 	if alignment == 0 {
 		alignment = defaultAlignment
-	} else if alignment&(alignment-1) != 0 {
+	} else if alignment & (alignment - 1) != 0 {
 		fail errors.New("vopack: alignment must be a power of two")
 	}
-
 	// Align the write position
 	aligned := alignUp(w.offset, alignment)
 	if aligned > w.offset {
-		pad := make([]byte, aligned-w.offset)
+		pad := make([]byte, aligned - w.offset)
 		w.file.Write(pad)?
 		w.offset = aligned
 	}
-
 	rawSize := uint64(len(data))
 	storedData := data
 	compression := opts.Compression
 	if compression != CompressNone && compression != CompressLZ4 {
 		fail errors.New("vopack: unsupported compression method")
 	}
-
 	if compression == CompressLZ4 {
 		if len(data) > 0 {
 			if compressed := Compress(data); compressed != nil {
@@ -117,28 +116,18 @@ func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
 			compression = CompressNone
 		}
 	}
-
 	storedSize := uint64(len(storedData))
 	checksum := crc32(storedData)
-
 	w.file.Write(storedData)?
-
 	w.entries = append(w.entries, writerEntry{
-		path:        name,
-		compression: compression,
-		dataOffset:  w.offset,
-		rawSize:     rawSize,
-		storedSize:  storedSize,
-		checksum:    checksum,
+		path: name, compression: compression, dataOffset: w.offset, rawSize: rawSize,
+		storedSize: storedSize, checksum: checksum,
 		manifest: ManifestAsset{
-			Path:         name,
-			Type:         normalizeManifestAssetType(opts.Type, name),
-			ContentHash:  manifestHash(data),
-			Dependencies: cloneStringSlice(opts.Dependencies),
+			Path: name, Type: normalizeManifestAssetType(opts.Type, name), ContentHash: manifestHash(data),
+			SourcePath: name, Dependencies: dependencies,
 		},
 	})
 	w.names[name] = true
-
 	w.offset += storedSize
 	return nil
 }
@@ -146,16 +135,20 @@ func (w *PackWriter) Add(name string, data []byte, opts EntryOpts) error {
 // AddFile reads a file from disk and adds it to the archive.
 func (w *PackWriter) AddFile(name string, srcPath string, opts EntryOpts) error {
 	data := os.ReadFile(srcPath)?
-	err := w.Add(name, data, opts)
-	if err != nil {
-		return err
-	}
-	w.entries[len(w.entries)-1].manifest.SourcePath = srcPath
-	return nil
+	return w.Add(name, data, opts)
 }
 
 // Close finalizes the archive by writing the path pool, entry table, and footer.
 func (w *PackWriter) Close() error {
+	if w.closed {
+		fail errors.New("vopack: writer is closed")
+	}
+	if w.closing {
+		fail errors.New("vopack: writer close is already in progress")
+	}
+	if err := w.verifyDependencyClosure(); err != nil {
+		return err
+	}
 	w.closing = true
 	if !w.names[ManifestPath] {
 		manifest := NewManifest(w.packName, w.packVersion)
@@ -172,61 +165,58 @@ func (w *PackWriter) Close() error {
 			return err
 		}
 	}
-
 	// Build path string pool
 	pathPool := make([]byte, 0)
 	pathOffsets := make([]uint32, len(w.entries))
 	pathLens := make([]uint16, len(w.entries))
-
 	for i, e := range w.entries {
-		if uint64(len(pathPool))+uint64(len(e.path)) > 0xFFFFFFFF {
+		if uint64(len(pathPool)) + uint64(len(e.path)) > 0xFFFFFFFF {
 			fail errors.New("vopack: path pool exceeds uint32 limit")
 		}
 		pathOffsets[i] = uint32(len(pathPool))
 		pathLens[i] = uint16(len(e.path))
 		pathPool = append(pathPool, []byte(e.path)...)
 	}
-
 	errdefer w.file.Close()
-
 	// Write path pool
 	pathPoolOff := w.offset
 	w.file.Write(pathPool)?
 	w.offset += uint64(len(pathPool))
-
 	// Write entry table (batched into single write)
 	entryTableOff := w.offset
-	entryBuf := make([]byte, len(w.entries)*entrySize)
+	entryBuf := make([]byte, len(w.entries) * entrySize)
 	for i, e := range w.entries {
-		copy(entryBuf[i*entrySize:], marshalEntry(entry{
-			pathOffset:  pathOffsets[i],
-			pathLen:     pathLens[i],
-			compression: e.compression,
-			dataOffset:  e.dataOffset,
-			rawSize:     e.rawSize,
-			storedSize:  e.storedSize,
-			checksum:    e.checksum,
+		copy(entryBuf[i * entrySize:], marshalEntry(entry{
+			pathOffset: pathOffsets[i], pathLen: pathLens[i], compression: e.compression,
+			dataOffset: e.dataOffset, rawSize: e.rawSize, storedSize: e.storedSize, checksum: e.checksum,
 		}))
 	}
 	w.file.Write(entryBuf)?
 	w.offset += uint64(len(entryBuf))
-
 	// Write footer
 	w.file.Write(marshalFooter(footer{
-		pathPoolOff:   pathPoolOff,
-		pathPoolSize:  uint64(len(pathPool)),
-		entryTableOff: entryTableOff,
-		entryCount:    uint32(len(w.entries)),
+		pathPoolOff: pathPoolOff, pathPoolSize: uint64(len(pathPool)), entryTableOff: entryTableOff,
+		entryCount: uint32(len(w.entries)),
 	}))?
 	w.offset += footerSize
-
 	// Update file header with final data region size
-	w.file.WriteAt(marshalHeader(fileHeader{
-		dataOff:  headerSize,
-		dataSize: pathPoolOff - headerSize,
-	}), 0)?
+	w.file.WriteAt(marshalHeader(fileHeader{dataOff: headerSize, dataSize: pathPoolOff - headerSize}), 0)?
+	err := w.file.Close()
+	if err == nil {
+		w.closed = true
+	}
+	return err
+}
 
-	return w.file.Close()
+func (w *PackWriter) verifyDependencyClosure() error {
+	for _, entry := range w.entries {
+		for _, dependency := range entry.manifest.Dependencies {
+			if !w.names[dependency] {
+				fail errors.New("vopack: missing dependency for requester " + entry.path + ": " + dependency)
+			}
+		}
+	}
+	return nil
 }
 
 func normalizeManifestAssetType(kind, path string) string {
@@ -234,13 +224,4 @@ func normalizeManifestAssetType(kind, path string) string {
 		return kind
 	}
 	return inferAssetType(path)
-}
-
-func cloneStringSlice(values []string) []string {
-	if values == nil {
-		return nil
-	}
-	out := make([]string, len(values))
-	copy(out, values)
-	return out
 }

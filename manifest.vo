@@ -1,8 +1,10 @@
 package vopack
 
 import (
+	"dyn"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 )
 
@@ -19,8 +21,8 @@ type ManifestAsset struct {
 	Path string `json:"path"`
 	Type string `json:"type,omitempty"`
 	ContentHash string `json:"contentHash"`
-	SourcePath string `json:"sourcePath,omitempty"`
-	Dependencies []string `json:"dependencies,omitempty"`
+	SourcePath string `json:"sourcePath"`
+	Dependencies []string `json:"dependencies"`
 }
 
 func NewManifest(packName, packVersion string) Manifest {
@@ -48,24 +50,174 @@ func marshalManifest(m Manifest) ([]byte, error) {
 	if m.Assets == nil {
 		m.Assets = []ManifestAsset{}
 	}
+	if err := validateManifestStructure(&m); err != nil {
+		return nil, err
+	}
 	return json.MarshalIndent(m, "", "  ")
 }
 
 func unmarshalManifest(data []byte) (*Manifest, error) {
+	if err := validateManifestJSONShape(data); err != nil {
+		return nil, err
+	}
 	var manifest Manifest
 	json.Unmarshal(data, &manifest)?
 	if manifest.FormatVersion != 1 {
 		fail errors.New("vopack: unsupported manifest version: " + strconv.Itoa(manifest.FormatVersion))
 	}
 	if manifest.Assets == nil {
-		manifest.Assets = []ManifestAsset{}
+		fail errors.New("vopack: manifest assets must be a JSON array")
+	}
+	if err := validateManifestStructure(&manifest); err != nil {
+		return nil, err
 	}
 	return &manifest, nil
 }
 
-func verifyManifestDependencies(manifest *Manifest, exists func(string) bool, requester string) error {
+// The typed decoder maps both a missing field and JSON null to a nil slice.
+// Inspect the dynamic JSON tree first so the wire protocol can distinguish
+// both forbidden encodings from the one canonical empty encoding, [].
+func validateManifestJSONShape(data []byte) error {
+	decoded, err := json.Decode(data)
+	if err != nil {
+		return err
+	}
+	root, ok := decoded.(dyn.MapObject)
+	if !ok {
+		fail errors.New("vopack: manifest root must be a JSON object")
+	}
+	assetsValue, ok := root["assets"]
+	if !ok || assetsValue == nil {
+		fail errors.New("vopack: manifest assets field is required")
+	}
+	assets, ok := assetsValue.(dyn.SliceObject)
+	if !ok {
+		fail errors.New("vopack: manifest assets must be a JSON array")
+	}
+	for i, assetValue := range assets {
+		asset, ok := assetValue.(dyn.MapObject)
+		if !ok {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) + " must be a JSON object")
+		}
+		dependenciesValue, ok := asset["dependencies"]
+		if !ok {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) + " dependencies field is required")
+		}
+		if dependenciesValue == nil {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) +
+				" dependencies must be a JSON array")
+		}
+		if _, ok := dependenciesValue.(dyn.SliceObject); !ok {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) +
+				" dependencies must be a JSON array")
+		}
+		sourcePathValue, ok := asset["sourcePath"]
+		if !ok || sourcePathValue == nil {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) + " sourcePath field is required")
+		}
+		if _, ok := sourcePathValue.(string); !ok {
+			fail errors.New("vopack: manifest asset " + strconv.Itoa(i) + " sourcePath must be a string")
+		}
+	}
+	return nil
+}
+
+func validateManifestAsset(asset *ManifestAsset) error {
+	if asset == nil {
+		fail errors.New("vopack: manifest asset is nil")
+	}
+	if err := validatePortablePath(asset.Path, false); err != nil {
+		return err
+	}
+	if asset.SourcePath != asset.Path {
+		fail errors.New("vopack: manifest sourcePath must equal path: " + asset.Path)
+	}
+	if err := validateManifestContentHash(asset.ContentHash, asset.Path); err != nil {
+		return err
+	}
+	if asset.Dependencies == nil {
+		fail errors.New("vopack: manifest dependencies must use [] for asset: " + asset.Path)
+	}
+	return validateCanonicalDependencyList(asset.Path, asset.Dependencies)
+}
+
+func validateManifestContentHash(hash, path string) error {
+	if len(hash) != 14 || hash[:6] != "crc32:" {
+		fail errors.New("vopack: invalid contentHash for asset: " + path)
+	}
+	for i := 6; i < len(hash); i++ {
+		c := hash[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			fail errors.New("vopack: invalid contentHash for asset: " + path)
+		}
+	}
+	return nil
+}
+
+func validateManifestStructure(manifest *Manifest) error {
 	if manifest == nil {
 		fail errors.New("vopack: manifest is nil")
+	}
+	names := map[string]bool{}
+	for i := range manifest.Assets {
+		asset := &manifest.Assets[i]
+		if err := validateManifestAsset(asset); err != nil {
+			return err
+		}
+		if names[asset.Path] {
+			fail errors.New("vopack: duplicate manifest asset: " + asset.Path)
+		}
+		if conflict := conflictingPortablePath(names, asset.Path); conflict != "" {
+			fail errors.New("vopack: manifest file/directory path collision: " + conflict + " and " +
+				asset.Path)
+		}
+		names[asset.Path] = true
+	}
+	return nil
+}
+
+func canonicalDependencyList(owner string, dependencies []string) ([]string, error) {
+	if err := validateDependencyList(owner, dependencies); err != nil {
+		return nil, err
+	}
+	result := make([]string, len(dependencies))
+	copy(result, dependencies)
+	sort.Strings(result)
+	return result, nil
+}
+
+func validateCanonicalDependencyList(owner string, dependencies []string) error {
+	if err := validateDependencyList(owner, dependencies); err != nil {
+		return err
+	}
+	for i := 1; i < len(dependencies); i++ {
+		if dependencies[i - 1] >= dependencies[i] {
+			fail errors.New("vopack: dependencies must be strictly increasing for asset: " + owner)
+		}
+	}
+	return nil
+}
+
+func validateDependencyList(owner string, dependencies []string) error {
+	seen := map[string]bool{}
+	for _, dependency := range dependencies {
+		if err := validatePortablePath(dependency, false); err != nil {
+			return errors.New("vopack: invalid dependency for " + owner + ": " + err.Error())
+		}
+		if dependency == owner {
+			fail errors.New("vopack: self dependency for asset: " + owner)
+		}
+		if seen[dependency] {
+			fail errors.New("vopack: duplicate dependency for asset " + owner + ": " + dependency)
+		}
+		seen[dependency] = true
+	}
+	return nil
+}
+
+func verifyManifestDependencies(manifest *Manifest, exists func(string) bool, requester string) error {
+	if err := validateManifestStructure(manifest); err != nil {
+		return err
 	}
 	if exists == nil {
 		fail errors.New("vopack: manifest verifier missing exists function")
@@ -73,18 +225,15 @@ func verifyManifestDependencies(manifest *Manifest, exists func(string) bool, re
 	declared := map[string]*ManifestAsset{}
 	for i := range manifest.Assets {
 		asset := &manifest.Assets[i]
-		if asset.Path == "" {
-			fail errors.New("vopack: manifest asset path must not be empty")
-		}
-		if declared[asset.Path] != nil {
-			fail errors.New("vopack: duplicate manifest asset: " + asset.Path)
-		}
 		declared[asset.Path] = asset
 		if !exists(asset.Path) {
 			fail errors.New("vopack: manifest asset missing payload: " + asset.Path)
 		}
 	}
 	if requester != "" {
+		if err := validatePortablePath(requester, false); err != nil {
+			return err
+		}
 		asset := declared[requester]
 		if asset == nil {
 			fail errors.New("vopack: manifest requester not found: " + requester)
@@ -101,9 +250,6 @@ func verifyManifestDependencies(manifest *Manifest, exists func(string) bool, re
 
 func verifyManifestAssetDependencies(declared map[string]*ManifestAsset, exists func(string) bool, requester string, asset *ManifestAsset) error {
 	for _, dep := range asset.Dependencies {
-		if dep == "" {
-			fail errors.New("vopack: empty dependency for requester: " + requester)
-		}
 		if declared[dep] == nil || !exists(dep) {
 			fail errors.New("vopack: missing dependency for requester " + requester + ": " + dep)
 		}

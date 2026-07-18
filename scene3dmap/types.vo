@@ -1,0 +1,172 @@
+// Package scene3dmap owns the portable Scene3D map wire contract.
+//
+// It intentionally depends only on the Vo standard library. Consumers can
+// decode, validate, and enumerate map resources without loading a renderer or
+// any native extension.
+package scene3dmap
+
+const FormatVersion = 1
+
+const (
+	MeshCollisionNone = "none"
+	MeshCollisionTrimesh = "trimesh"
+	PickModeDefault = "default"
+	PickModeEnabled = "enabled"
+	PickModeDisabled = "disabled"
+	PrimitiveLayerKindStatic = "static"
+	PrimitiveLayerKindDynamic = "dynamic"
+	PrimitiveLayerKindTransparent = "transparent"
+)
+
+type Vec3 struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+	Z float64 `json:"z"`
+}
+
+type Color struct {
+	R float64 `json:"r"`
+	G float64 `json:"g"`
+	B float64 `json:"b"`
+	A float64 `json:"a"`
+}
+
+type TerrainSplatLayer struct {
+	Texture string `json:"texture"`
+	Normal string `json:"normal,omitempty"`
+	MetallicRoughness string `json:"metallicRoughness,omitempty"`
+	UVScale float64 `json:"uvScale,omitempty"`
+	NormalScale float64 `json:"normalScale,omitempty"`
+}
+
+type TerrainMaterialTuning struct {
+	MacroScale float64 `json:"macroScale,omitempty"`
+	MacroStrength float64 `json:"macroStrength,omitempty"`
+	DetailNear float64 `json:"detailNear,omitempty"`
+	DetailFar float64 `json:"detailFar,omitempty"`
+	SlopeStart float64 `json:"slopeStart,omitempty"`
+	SlopeEnd float64 `json:"slopeEnd,omitempty"`
+	SlopeDirtStrength float64 `json:"slopeDirtStrength,omitempty"`
+	SlopeRockStrength float64 `json:"slopeRockStrength,omitempty"`
+	AntiTileStrength float64 `json:"antiTileStrength,omitempty"`
+	DetailStrength float64 `json:"detailStrength,omitempty"`
+	NormalNear float64 `json:"normalNear,omitempty"`
+	NormalFar float64 `json:"normalFar,omitempty"`
+	HeightBlendStrength float64 `json:"heightBlendStrength,omitempty"`
+	HeightLow float64 `json:"heightLow,omitempty"`
+	HeightHigh float64 `json:"heightHigh,omitempty"`
+	CurvatureStrength float64 `json:"curvatureStrength,omitempty"`
+}
+
+type Material struct {
+	BaseColor Color `json:"baseColor,omitempty"`
+	BaseColorSet bool `json:"baseColorSet,omitempty"`
+	Roughness float64 `json:"roughness,omitempty"`
+	Metallic float64 `json:"metallic,omitempty"`
+	NormalScale float64 `json:"normalScale,omitempty"`
+	UVScale float64 `json:"uvScale,omitempty"`
+	DetailStrength float64 `json:"detailStrength,omitempty"`
+	MacroBlend float64 `json:"macroBlend,omitempty"`
+	RoughnessResponse float64 `json:"roughnessResponse,omitempty"`
+	ToonRampResponse float64 `json:"toonRampResponse,omitempty"`
+	ShadingMode int `json:"shadingMode,omitempty"`
+	WrapMode int `json:"wrapMode,omitempty"`
+	FilterMode int `json:"filterMode,omitempty"`
+}
+
+type TerrainSplat struct {
+	Control string `json:"control"`
+	Layers []TerrainSplatLayer `json:"layers"`
+	Tuning TerrainMaterialTuning `json:"tuning,omitempty"`
+}
+
+type Terrain struct {
+	Heightmap string `json:"heightmap"`
+	Texture string `json:"texture,omitempty"`
+	Normal string `json:"normal,omitempty"`
+	MetallicRoughness string `json:"metallicRoughness,omitempty"`
+	Splat *TerrainSplat `json:"splat,omitempty"`
+	Position Vec3 `json:"position,omitempty"`
+	Width float64 `json:"width"`
+	Height float64 `json:"height"`
+	Depth float64 `json:"depth"`
+	UVScale float64 `json:"uvScale,omitempty"`
+	NormalScale float64 `json:"normalScale,omitempty"`
+	Roughness float64 `json:"roughness,omitempty"`
+	Metallic float64 `json:"metallic,omitempty"`
+	Tint Color `json:"tint,omitempty"`
+	TintSet bool `json:"tintSet,omitempty"`
+	Tag string `json:"tag,omitempty"`
+	Friction float64 `json:"friction,omitempty"`
+	CullDistance float64 `json:"cullDistance,omitempty"`
+	CullRadius float64 `json:"cullRadius,omitempty"`
+	FrustumCull bool `json:"frustumCull,omitempty"`
+}
+
+type MeshLodLevel struct {
+	Model string `json:"model"`
+	Distance float64 `json:"distance"`
+}
+
+type Mesh struct {
+	Name string `json:"name"`
+	Model string `json:"model"`
+	LodLevels []MeshLodLevel `json:"lodLevels,omitempty"`
+	Collision string `json:"collision,omitempty"`
+	Hidden bool `json:"hidden,omitempty"`
+	Position Vec3 `json:"position,omitempty"`
+	Rotation Vec3 `json:"rotation,omitempty"`
+	Scale Vec3 `json:"scale,omitempty"`
+	Material Material `json:"material,omitempty"`
+	Tint Color `json:"tint,omitempty"`
+	TintSet bool `json:"tintSet,omitempty"`
+	PickMode string `json:"pickMode,omitempty"`
+	Friction float64 `json:"friction,omitempty"`
+	CullDistance float64 `json:"cullDistance,omitempty"`
+	CullRadius float64 `json:"cullRadius,omitempty"`
+	FrustumCull bool `json:"frustumCull,omitempty"`
+}
+
+type MeshTerrain struct {
+	Name string `json:"name"`
+	Model string `json:"model"`
+	LodLevels []MeshLodLevel `json:"lodLevels,omitempty"`
+	HeightGrid string `json:"heightGrid"`
+	Splat *TerrainSplat `json:"splat,omitempty"`
+	Material Material `json:"material,omitempty"`
+	PickMode string `json:"pickMode,omitempty"`
+	Tag string `json:"tag,omitempty"`
+	CullDistance float64 `json:"cullDistance,omitempty"`
+	CullRadius float64 `json:"cullRadius,omitempty"`
+	FrustumCull bool `json:"frustumCull,omitempty"`
+}
+
+type PrimitiveLayer struct {
+	Name string `json:"name"`
+	Source string `json:"source"`
+	Kind string `json:"kind,omitempty"`
+	ChunkCellSize float64 `json:"chunkCellSize,omitempty"`
+	PreloadChunks bool `json:"preloadChunks,omitempty"`
+	Slots []string `json:"slots"`
+}
+
+type Spawn struct {
+	Name string `json:"name"`
+	Position Vec3 `json:"position"`
+	Yaw float64 `json:"yaw,omitempty"`
+}
+
+type Asset struct {
+	Version int `json:"version"`
+	Name string `json:"name"`
+	Terrain *Terrain `json:"terrain,omitempty"`
+	Meshes []Mesh `json:"meshes,omitempty"`
+	MeshTerrains []MeshTerrain `json:"meshTerrains,omitempty"`
+	PrimitiveLayers []PrimitiveLayer `json:"primitiveLayers,omitempty"`
+	Spawns []Spawn `json:"spawns,omitempty"`
+}
+
+type Dependency struct {
+	Path string
+	Kind string
+}

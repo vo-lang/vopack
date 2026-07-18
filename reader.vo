@@ -11,19 +11,19 @@ import (
 
 // tableEntry is the in-memory index entry for a single resource.
 type tableEntry struct {
-	dataOffset  uint64
-	rawSize     uint64
-	storedSize  uint64
+	dataOffset uint64
+	rawSize uint64
+	storedSize uint64
 	compression uint8
-	checksum    uint32
-	internal    bool
+	checksum uint32
+	internal bool
 }
 
 // PackReader reads resources from a .vpak archive.
 type PackReader struct {
-	file    *os.File
-	index   map[string]tableEntry
-	paths   []string // all paths in insertion order
+	file *os.File
+	index map[string]tableEntry
+	paths []string // all paths in insertion order
 }
 
 // Open opens an existing .vpak archive for reading.
@@ -34,29 +34,25 @@ type PackReader struct {
 func Open(path string) (*PackReader, error) {
 	file := os.Open(path)?
 	errdefer file.Close()
-
 	// Read footer from the last 32 bytes
 	info := file.Stat()?
 	fileSize := info.Size()
-	if fileSize < int64(headerSize+footerSize) {
+	if fileSize < int64(headerSize + footerSize) {
 		fail errors.New("vopack: file too small")
 	}
-
 	ftrBuf := make([]byte, footerSize)
-	file.ReadAt(ftrBuf, fileSize-int64(footerSize))?
+	file.ReadAt(ftrBuf, fileSize - int64(footerSize))?
 	ftr := unmarshalFooter(ftrBuf)?
-
 	// Validate header
 	hdrBuf := make([]byte, headerSize)
 	file.ReadAt(hdrBuf, 0)?
 	hdr := unmarshalHeader(hdrBuf)?
-
 	fileSizeU := uint64(fileSize)
 	footerOff := fileSizeU - footerSize
 	if ftr.pathPoolOff > footerOff {
 		fail errors.New("vopack: invalid path pool offset")
 	}
-	if ftr.pathPoolSize > footerOff-ftr.pathPoolOff {
+	if ftr.pathPoolSize > footerOff - ftr.pathPoolOff {
 		fail errors.New("vopack: invalid path pool size")
 	}
 	pathPoolEnd := ftr.pathPoolOff + ftr.pathPoolSize
@@ -71,17 +67,15 @@ func Open(path string) (*PackReader, error) {
 	if ftr.entryTableOff < pathPoolEnd || ftr.entryTableOff > footerOff {
 		fail errors.New("vopack: invalid entry table offset")
 	}
-	if entryTableSize > footerOff-ftr.entryTableOff {
+	if entryTableSize > footerOff - ftr.entryTableOff {
 		fail errors.New("vopack: invalid entry table size")
 	}
-
 	// Read path pool
 	var pathPool []byte
 	if ftr.pathPoolSize > 0 {
 		pathPool = make([]byte, ftr.pathPoolSize)
 		file.ReadAt(pathPool, int64(ftr.pathPoolOff))?
 	}
-
 	// Read entry table
 	var entryBuf []byte
 	if ftr.entryCount > 0 {
@@ -89,13 +83,12 @@ func Open(path string) (*PackReader, error) {
 		entryBuf = make([]byte, entryTableSize)
 		file.ReadAt(entryBuf, int64(ftr.entryTableOff))?
 	}
-
 	// Build index
 	index := make(map[string]tableEntry)
+	names := make(map[string]bool)
 	paths := make([]string, 0, int(ftr.entryCount))
-
 	for i := 0; i < int(ftr.entryCount); i++ {
-		e := unmarshalEntry(entryBuf[i*entrySize : (i+1)*entrySize])?
+		e := unmarshalEntry(entryBuf[i * entrySize:(i + 1) * entrySize])?
 		pathEnd := uint64(e.pathOffset) + uint64(e.pathLen)
 		if pathEnd > uint64(len(pathPool)) {
 			fail errors.New("vopack: entry path out of bounds")
@@ -109,34 +102,32 @@ func Open(path string) (*PackReader, error) {
 		if e.dataOffset < hdr.dataOff || e.dataOffset > dataEnd {
 			fail errors.New("vopack: entry data offset out of bounds")
 		}
-		if e.storedSize > dataEnd-e.dataOffset {
+		if e.storedSize > dataEnd - e.dataOffset {
 			fail errors.New("vopack: entry data size out of bounds")
 		}
 		if e.compression == CompressNone && e.rawSize != e.storedSize {
 			fail errors.New("vopack: uncompressed entry size mismatch")
 		}
-		name := string(pathPool[e.pathOffset : e.pathOffset+uint32(e.pathLen)])
+		name := string(pathPool[e.pathOffset:e.pathOffset + uint32(e.pathLen)])
+		if err := validatePortablePath(name, true); err != nil {
+			return nil, err
+		}
 		if _, ok := index[name]; ok {
 			fail errors.New("vopack: duplicate resource path: " + name)
 		}
-		index[name] = tableEntry{
-			dataOffset:  e.dataOffset,
-			rawSize:     e.rawSize,
-			storedSize:  e.storedSize,
-			compression: e.compression,
-			checksum:    e.checksum,
-			internal:    name == ManifestPath,
+		if conflict := conflictingPortablePath(names, name); conflict != "" {
+			fail errors.New("vopack: file/directory path collision: " + conflict + " and " + name)
 		}
+		index[name] = tableEntry{
+			dataOffset: e.dataOffset, rawSize: e.rawSize, storedSize: e.storedSize,
+			compression: e.compression, checksum: e.checksum, internal: name == ManifestPath,
+		}
+		names[name] = true
 		if name != ManifestPath {
 			paths = append(paths, name)
 		}
 	}
-
-	return &PackReader{
-		file:  file,
-		index: index,
-		paths: paths,
-	}, nil
+	return &PackReader{file: file, index: index, paths: paths}, nil
 }
 
 // Read returns the decompressed content of a resource by its path.
@@ -146,6 +137,9 @@ func (r *PackReader) Read(name string) ([]byte, error) {
 	if name == ManifestPath {
 		fail errors.New("vopack: manifest is metadata, use Manifest")
 	}
+	if err := validatePortablePath(name, false); err != nil {
+		return nil, err
+	}
 	return r.readEntry(name)
 }
 
@@ -154,16 +148,13 @@ func (r *PackReader) readEntry(name string) ([]byte, error) {
 	if !ok {
 		fail errors.New("vopack: resource not found: " + name)
 	}
-
 	// Read stored (possibly compressed) data from disk
 	stored := make([]byte, te.storedSize)
 	r.file.ReadAt(stored, int64(te.dataOffset))?
-
 	// Verify checksum
 	if crc32(stored) != te.checksum {
 		fail errors.New("vopack: checksum mismatch: " + name)
 	}
-
 	// Decompress if needed
 	if te.compression == CompressLZ4 {
 		return Decompress(stored, int(te.rawSize))
@@ -173,18 +164,24 @@ func (r *PackReader) readEntry(name string) ([]byte, error) {
 
 // Has returns true if the archive contains a resource with the given path.
 func (r *PackReader) Has(name string) bool {
+	if validatePortablePath(name, false) != nil {
+		return false
+	}
 	te, ok := r.index[name]
 	return ok && !te.internal
 }
 
 // Size returns the uncompressed size of a resource.
 func (r *PackReader) Size(name string) (uint64, error) {
+	if name == ManifestPath {
+		fail errors.New("vopack: manifest is metadata, use Manifest")
+	}
+	if err := validatePortablePath(name, false); err != nil {
+		return 0, err
+	}
 	te, ok := r.index[name]
 	if !ok {
 		fail errors.New("vopack: resource not found: " + name)
-	}
-	if te.internal {
-		fail errors.New("vopack: manifest is metadata, use Manifest")
 	}
 	return te.rawSize, nil
 }
@@ -219,15 +216,60 @@ func (r *PackReader) Manifest() (*Manifest, error) {
 	return unmarshalManifest(data)
 }
 
+// VerifyManifest performs complete archive-manifest verification: every
+// dependency edge, the exact public-entry closure, and each contentHash against
+// the decompressed payload.
+func (r *PackReader) VerifyManifest() error {
+	return r.verifyManifest("")
+}
+
+// VerifyManifestDependencies verifies the complete manifest and additionally
+// requires requester to name a declared public asset.
 func (r *PackReader) VerifyManifestDependencies(requester string) error {
+	if requester == "" {
+		return r.VerifyManifest()
+	}
+	return r.verifyManifest(requester)
+}
+
+func (r *PackReader) verifyManifest(requester string) error {
 	manifest, err := r.Manifest()
 	if err != nil {
 		return err
 	}
-	return verifyManifestDependencies(manifest, func(path string) bool {
+	exists := func(path string) bool {
 		te, ok := r.index[path]
 		return ok && !te.internal
-	}, requester)
+	}
+	if err := verifyManifestDependencies(manifest, exists, ""); err != nil {
+		return err
+	}
+	if requester != "" {
+		if err := validatePortablePath(requester, false); err != nil {
+			return err
+		}
+		if manifest.Find(requester) == nil {
+			fail errors.New("vopack: manifest requester not found: " + requester)
+		}
+	}
+	if len(manifest.Assets) != len(r.paths) {
+		fail errors.New("vopack: manifest assets do not match public archive entries")
+	}
+	for _, path := range r.paths {
+		if manifest.Find(path) == nil {
+			fail errors.New("vopack: public archive entry missing from manifest: " + path)
+		}
+	}
+	for _, asset := range manifest.Assets {
+		payload, err := r.readEntry(asset.Path)
+		if err != nil {
+			return err
+		}
+		if manifestHash(payload) != asset.ContentHash {
+			fail errors.New("vopack: contentHash mismatch for asset: " + asset.Path)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying file.

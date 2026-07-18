@@ -1,3 +1,2 @@
-module github.com/vo-lang/vopack
-
-vo ^0.1.0
+module = "github.com/vo-lang/vopack"
+vo = "^0.1.0"

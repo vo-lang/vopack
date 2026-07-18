@@ -6,9 +6,11 @@
 // in-memory path index with a single metadata pass.
 //
 // The package provides the following guarantees:
-//   - resource paths are unique within one archive
+//   - public resource paths use lowercase ASCII [a-z0-9._-]+ components and '/' separators
+//   - paths are unique, have no file/directory collisions, and cannot enter the reserved .vopack namespace
 //   - footer metadata is validated when an archive is opened
 //   - stored entry bytes are checksum-verified when a resource is read
+//   - explicit manifest verification authenticates the exact public-entry closure, dependency graph, and payload hashes
 //   - LZ4 compression is optional and transparent to callers of Read
 //   - listing preserves insertion order within a single archive
 //

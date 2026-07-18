@@ -1,0 +1,104 @@
+package vopack
+
+import (
+	"errors"
+)
+
+const (
+	maxPortablePathBytes = 4096
+	maxPortableComponentBytes = 255
+)
+
+// validatePortablePath is the single path grammar used by archive entries,
+// manifest assets, and manifest dependency edges. Public paths are lowercase
+// ASCII components separated by '/'. The .vopack top-level namespace belongs
+// to the container format; only its exact internal manifest path is accepted
+// when allowInternalManifest is true.
+func validatePortablePath(path string, allowInternalManifest bool) error {
+	if path == "" {
+		fail errors.New("vopack: portable path must not be empty")
+	}
+	if len(path) > maxPortablePathBytes {
+		fail errors.New("vopack: portable path exceeds 4096 bytes: " + path)
+	}
+	if path == ManifestPath {
+		if allowInternalManifest {
+			return nil
+		}
+		fail errors.New("vopack: .vopack namespace is reserved: " + path)
+	}
+	componentStart := 0
+	componentIndex := 0
+	for i := 0; i <= len(path); i++ {
+		if i < len(path) && path[i] != '/' {
+			continue
+		}
+		component := path[componentStart:i]
+		if err := validatePortableComponent(component); err != nil {
+			return errors.New("vopack: invalid portable path " + path + ": " + err.Error())
+		}
+		if componentIndex == 0 && component == ".vopack" {
+			fail errors.New("vopack: .vopack namespace is reserved: " + path)
+		}
+		componentIndex++
+		componentStart = i + 1
+	}
+	return nil
+}
+
+func validatePortableComponent(component string) error {
+	if component == "" {
+		fail errors.New("path component must not be empty")
+	}
+	if len(component) > maxPortableComponentBytes {
+		fail errors.New("path component exceeds 255 bytes")
+	}
+	if component == "." || component == ".." {
+		fail errors.New("dot path components are forbidden")
+	}
+	for i := 0; i < len(component); i++ {
+		c := component[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '.' && c != '_' && c != '-' {
+			fail errors.New("path components must match [a-z0-9._-]+")
+		}
+	}
+	if component[len(component) - 1] == '.' {
+		fail errors.New("path component must not end with a dot")
+	}
+	if isWindowsDeviceStem(component) {
+		fail errors.New("Windows device stems are forbidden")
+	}
+	return nil
+}
+
+func isWindowsDeviceStem(component string) bool {
+	stemEnd := len(component)
+	for i := 0; i < len(component); i++ {
+		if component[i] == '.' {
+			stemEnd = i
+			break
+		}
+	}
+	stem := component[:stemEnd]
+	if stem == "con" || stem == "prn" || stem == "aux" || stem == "nul" {
+		return true
+	}
+	if len(stem) == 4 && stem[3] >= '1' && stem[3] <= '9' {
+		prefix := stem[:3]
+		return prefix == "com" || prefix == "lpt"
+	}
+	return false
+}
+
+func conflictingPortablePath(names map[string]bool, candidate string) string {
+	for existing := range names {
+		if portablePathIsAncestor(existing, candidate) || portablePathIsAncestor(candidate, existing) {
+			return existing
+		}
+	}
+	return ""
+}
+
+func portablePathIsAncestor(parent, child string) bool {
+	return len(child) > len(parent) && child[:len(parent)] == parent && child[len(parent)] == '/'
+}

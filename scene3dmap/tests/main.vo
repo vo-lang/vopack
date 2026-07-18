@@ -1,0 +1,156 @@
+package main
+
+import (
+	"github.com/vo-lang/vopack/scene3dmap"
+	"math"
+	"path/filepath"
+)
+
+func assert(condition bool, message string) {
+	if !condition {
+		panic("FAIL: " + message)
+	}
+}
+
+func contains(value, needle string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	if len(needle) > len(value) {
+		return false
+	}
+	for i := 0; i <= len(value) - len(needle); i++ {
+		if value[i:i + len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func main() {
+	testCompleteWireSchemaAndDependencies()
+	testStrictUnknownFields()
+	testStrictDocumentShape()
+	testSemanticValidation()
+	testDependencyDeduplication()
+	println("SCENE3DMAP TESTS PASSED")
+}
+
+func testCompleteWireSchemaAndDependencies() {
+	data := []byte(`{
+		"version":1,
+		"name":"complete",
+		"terrain":{
+			"heightmap":"terrain/height.bin",
+			"texture":"terrain/color.png",
+			"normal":"terrain/normal.png",
+			"metallicRoughness":"terrain/mr.png",
+			"position":{"x":1,"y":2,"z":3},
+			"width":100,"height":20,"depth":80,
+			"uvScale":4,"normalScale":1,"roughness":0.8,"metallic":0.2,
+			"tint":{"r":0.8,"g":0.7,"b":0.6,"a":1},"tintSet":true,
+			"tag":"ground","friction":0.9,"cullDistance":800,"cullRadius":100,"frustumCull":true
+		},
+		"meshes":[{
+			"name":"bridge","model":"mesh/bridge.glb",
+			"lodLevels":[{"model":"mesh/bridge_lod.glb","distance":120}],
+			"collision":"trimesh","hidden":false,
+			"position":{"x":1,"y":2,"z":3},"rotation":{"x":0,"y":1,"z":0},"scale":{"x":1,"y":1,"z":1},
+			"material":{"baseColor":{"r":1,"g":0.5,"b":0.25,"a":1},"baseColorSet":true,
+				"roughness":0.7,"metallic":0.1,"normalScale":1,"uvScale":2,"detailStrength":1,
+				"macroBlend":0.2,"roughnessResponse":0.9,"toonRampResponse":0.1,
+				"shadingMode":1,"wrapMode":1,"filterMode":1},
+			"tint":{"r":1,"g":1,"b":1,"a":1},"tintSet":true,"pickMode":"enabled",
+			"friction":0.8,"cullDistance":900,"cullRadius":120,"frustumCull":true
+		}],
+		"meshTerrains":[{
+			"name":"land","model":"mesh/land.glb","lodLevels":[{"model":"mesh/land_lod.glb","distance":300}],
+			"heightGrid":"terrain/grid.bin",
+			"splat":{"control":"terrain/control.png","layers":[
+				{"texture":"terrain/l0.png","normal":"terrain/l0_n.png","metallicRoughness":"terrain/l0_mr.png","uvScale":8,"normalScale":0.5},
+				{"texture":"terrain/l1.png","normal":"terrain/l1_n.png","metallicRoughness":"terrain/l1_mr.png","uvScale":7,"normalScale":0.4},
+				{"texture":"terrain/l2.png","normal":"terrain/l2_n.png","metallicRoughness":"terrain/l2_mr.png","uvScale":6,"normalScale":0.3},
+				{"texture":"terrain/l3.png","normal":"terrain/l3_n.png","metallicRoughness":"terrain/l3_mr.png","uvScale":5,"normalScale":0.2}
+			],"tuning":{"macroScale":1,"macroStrength":0.2,"detailNear":20,"detailFar":500,
+				"slopeStart":0.1,"slopeEnd":0.8,"slopeDirtStrength":0.2,"slopeRockStrength":0.6,
+				"antiTileStrength":0.5,"detailStrength":0.9,"normalNear":10,"normalFar":400,
+				"heightBlendStrength":0.1,"heightLow":-2,"heightHigh":30,"curvatureStrength":0.2}},
+			"material":{"roughness":0.9,"metallic":0,"normalScale":1,"uvScale":1,"detailStrength":1,
+				"macroBlend":0.1,"roughnessResponse":0.8,"toonRampResponse":0.1},
+			"pickMode":"disabled","tag":"land","cullDistance":1200,"cullRadius":400,"frustumCull":true
+		}],
+		"primitiveLayers":[{"name":"foliage","source":"layers/foliage.bin","kind":"static",
+			"chunkCellSize":32,"preloadChunks":true,"slots":["grass","flower"]}],
+		"spawns":[{"name":"player","position":{"x":1,"y":2,"z":3},"yaw":1.5}]
+	}`)
+	asset, err := scene3dmap.Decode(data)
+	assert(err == nil, "complete wire schema decodes: " + errorString(err))
+	assert(asset.Version == scene3dmap.FormatVersion && asset.Name == "complete", "identity fields")
+	assert(len(asset.Meshes) == 1 && len(asset.MeshTerrains) == 1, "scene collections")
+	assert(len(asset.MeshTerrains[0].Splat.Layers) == 4, "four splat layers")
+	deps := scene3dmap.Dependencies(asset, "assets/maps")
+	assert(len(deps) == 23, "complete dependency closure")
+	assert(deps[0].Path == filepath.Join("assets/maps", "terrain/height.bin"), "dependency base resolution")
+	assert(deps[0].Kind == "terrain-heightmap", "dependency kind")
+	assert(deps[len(deps) - 1].Path == filepath.Join("assets/maps", "layers/foliage.bin"), "primitive dependency order")
+	terrainSplat, err := scene3dmap.Decode([]byte(`{"version":1,"name":"terrain-splat","terrain":{"heightmap":"h.bin","splat":{"control":"c.png","layers":[{"texture":"a.png"},{"texture":"b.png"},{"texture":"c.png"},{"texture":"d.png"}]},"width":1,"height":1,"depth":1}}`))
+	assert(err == nil && terrainSplat.Terrain.Splat != nil, "heightmap terrain accepts the shared splat wire shape")
+}
+
+func testStrictUnknownFields() {
+	_, err := scene3dmap.Decode([]byte(`{"version":1,"name":"x","future":true}`))
+	assert(err != nil && contains(err.Error(), "$: unknown field future"), "unknown root field")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","meshes":[{"name":"m","model":"m.glb","future":true}]}`))
+	assert(err != nil && contains(err.Error(), "$.meshes[0]: unknown field future"), "unknown collection field")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","meshes":[{"name":"m","model":"m.glb","material":{"baseColor":{"r":1,"future":true}}}]}`))
+	assert(err != nil && contains(err.Error(), "$.meshes[0].material.baseColor: unknown field future"), "unknown deep field")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"first","name":"second"}`))
+	assert(err != nil && contains(err.Error(), "$: duplicate field name"), "duplicate root field")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","meshes":[{"name":"m","model":"a","model":"b"}]}`))
+	assert(err != nil && contains(err.Error(), "$.meshes[0]: duplicate field model"), "duplicate nested field")
+}
+
+func testStrictDocumentShape() {
+	_, err := scene3dmap.Decode([]byte(`[]`))
+	assert(err != nil && contains(err.Error(), "$ must be an object"), "object root required")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","meshes":{}}`))
+	assert(err != nil && contains(err.Error(), "$.meshes must be an array"), "array shape required")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","spawns":[{"name":"s","position":null}]}`))
+	assert(err != nil && contains(err.Error(), "$.spawns[0].position must be an object"), "embedded object rejects null")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x"} {}`))
+	assert(err != nil && contains(err.Error(), "decode JSON"), "trailing JSON rejected")
+}
+
+func testSemanticValidation() {
+	_, err := scene3dmap.Decode([]byte(`{"version":2,"name":"x"}`))
+	assert(err != nil && contains(err.Error(), "unsupported version 2; expected 1"), "version contract")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":""}`))
+	assert(err != nil && contains(err.Error(), "name must not be empty"), "map name required")
+	_, err = scene3dmap.Decode([]byte(`{"version":1,"name":"x","meshes":[{"name":"same","model":"a"},{"name":"same","model":"b"}]}`))
+	assert(err != nil && contains(err.Error(), "duplicate mesh name: same"), "duplicate mesh names rejected")
+	badFinite := &scene3dmap.Asset{
+		Version: scene3dmap.FormatVersion, Name: "bad-finite",
+		Meshes: []scene3dmap.Mesh{{Name: "m", Model: "m.glb", Position: scene3dmap.Vec3{X: math.NaN()}}},
+	}
+	err = scene3dmap.Validate(badFinite)
+	assert(err != nil && contains(err.Error(), "non-finite number"), "programmatic assets reject non-finite values")
+}
+
+func testDependencyDeduplication() {
+	asset := &scene3dmap.Asset{
+		Version: scene3dmap.FormatVersion, Name: "dedupe",
+		Terrain: &scene3dmap.Terrain{Heightmap: "shared.bin", Width: 1, Height: 1, Depth: 1},
+		Meshes: []scene3dmap.Mesh{{Name: "m", Model: "shared.bin"}},
+	}
+	deps := scene3dmap.Dependencies(asset, ".")
+	assert(len(deps) == 1, "duplicate paths collapse")
+	assert(deps[0].Kind == "terrain-heightmap", "first dependency kind wins")
+	assert(scene3dmap.ResolvePath(".", "shared.bin") == "shared.bin", "dot base is identity")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}

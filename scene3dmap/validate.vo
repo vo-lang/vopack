@@ -1,0 +1,287 @@
+package scene3dmap
+
+import (
+	"errors"
+	"math"
+	"strconv"
+)
+
+// Validate checks the complete semantic contract for one decoded or
+// programmatically constructed map.
+func Validate(asset *Asset) error {
+	if asset == nil {
+		return invalid("asset must not be nil")
+	}
+	if asset.Version != FormatVersion {
+		return invalid("unsupported version " + strconv.Itoa(asset.Version) + "; expected " +
+			strconv.Itoa(FormatVersion))
+	}
+	if asset.Name == "" {
+		return invalid("name must not be empty")
+	}
+	if asset.Terrain != nil {
+		ValidateTerrain(*asset.Terrain)?
+	}
+	seenMeshes := map[string]bool{}
+	for _, mesh := range asset.Meshes {
+		validateMesh(mesh)?
+		if seenMeshes[mesh.Name] {
+			return invalid("duplicate mesh name: " + mesh.Name)
+		}
+		seenMeshes[mesh.Name] = true
+	}
+	seenMeshTerrains := map[string]bool{}
+	for _, terrain := range asset.MeshTerrains {
+		validateMeshTerrain(terrain)?
+		if seenMeshTerrains[terrain.Name] {
+			return invalid("duplicate mesh terrain name: " + terrain.Name)
+		}
+		seenMeshTerrains[terrain.Name] = true
+	}
+	seenPrimitiveLayers := map[string]bool{}
+	for _, layer := range asset.PrimitiveLayers {
+		validatePrimitiveLayer(layer)?
+		if seenPrimitiveLayers[layer.Name] {
+			return invalid("duplicate primitive layer name: " + layer.Name)
+		}
+		seenPrimitiveLayers[layer.Name] = true
+	}
+	seenSpawns := map[string]bool{}
+	for _, spawn := range asset.Spawns {
+		if spawn.Name == "" {
+			return invalid("spawn name must not be empty")
+		}
+		if seenSpawns[spawn.Name] {
+			return invalid("duplicate spawn name: " + spawn.Name)
+		}
+		validateFiniteVec3(spawn.Position, "spawn " + spawn.Name + " position")?
+		validateFiniteNumbers("spawn " + spawn.Name, spawn.Yaw)?
+		seenSpawns[spawn.Name] = true
+	}
+	return nil
+}
+
+// ValidateTerrain validates the terrain fragment shared by Scene3D maps and
+// higher-level track documents.
+func ValidateTerrain(terrain Terrain) error {
+	if terrain.Heightmap == "" {
+		return invalid("terrain heightmap is required")
+	}
+	validateFiniteVec3(terrain.Position, "terrain position")?
+	validateFiniteColor(terrain.Tint, "terrain tint")?
+	validateFiniteNumbers("terrain", terrain.Width, terrain.Height, terrain.Depth, terrain.UVScale, terrain.NormalScale, terrain.Roughness, terrain.Metallic, terrain.Friction, terrain.CullDistance, terrain.CullRadius)?
+	if terrain.Width <= 0 || terrain.Height <= 0 || terrain.Depth <= 0 {
+		return invalid("terrain width, height, and depth must be > 0")
+	}
+	if terrain.UVScale < 0 {
+		return invalid("terrain uvScale must be >= 0")
+	}
+	if terrain.NormalScale < 0 {
+		return invalid("terrain normalScale must be >= 0")
+	}
+	if terrain.Roughness < 0 {
+		return invalid("terrain roughness must be >= 0")
+	}
+	if terrain.Metallic < 0 || terrain.Metallic > 1 {
+		return invalid("terrain metallic must be in range 0..1")
+	}
+	if terrain.CullDistance < 0 {
+		return invalid("terrain cullDistance must be >= 0")
+	}
+	if terrain.CullRadius < 0 {
+		return invalid("terrain cullRadius must be >= 0")
+	}
+	if terrain.Splat != nil {
+		if terrain.Texture != "" || terrain.Normal != "" || terrain.MetallicRoughness != "" ||
+			terrain.UVScale != 0 ||
+			terrain.NormalScale != 0 ||
+			terrain.Roughness != 0 ||
+			terrain.Metallic != 0 {
+			return invalid("terrain single-material fields cannot be mixed with splat")
+		}
+		validateTerrainSplat(terrain.Splat, "terrain")?
+	}
+	return nil
+}
+
+func validateTerrainSplat(splat *TerrainSplat, owner string) error {
+	if splat == nil {
+		return nil
+	}
+	if splat.Control == "" {
+		return invalid(owner + " splat control is required")
+	}
+	if len(splat.Layers) != 4 {
+		return invalid(owner + " splat requires exactly 4 layers")
+	}
+	for _, layer := range splat.Layers {
+		if layer.Texture == "" {
+			return invalid(owner + " splat layer texture is required")
+		}
+		if layer.UVScale < 0 {
+			return invalid(owner + " splat layer uvScale must be >= 0")
+		}
+		if layer.NormalScale < 0 {
+			return invalid(owner + " splat layer normalScale must be >= 0")
+		}
+		validateFiniteNumbers(owner + " splat layer", layer.UVScale, layer.NormalScale)?
+	}
+	tuning := splat.Tuning
+	validateFiniteNumbers(owner + " splat tuning", tuning.MacroScale, tuning.MacroStrength, tuning.DetailNear, tuning.DetailFar, tuning.SlopeStart, tuning.SlopeEnd, tuning.SlopeDirtStrength, tuning.SlopeRockStrength, tuning.AntiTileStrength, tuning.DetailStrength, tuning.NormalNear, tuning.NormalFar, tuning.HeightBlendStrength, tuning.HeightLow, tuning.HeightHigh, tuning.CurvatureStrength)?
+	return nil
+}
+
+func validateMesh(mesh Mesh) error {
+	if mesh.Name == "" {
+		return invalid("mesh name must not be empty")
+	}
+	if mesh.Model == "" {
+		return invalid("mesh model is required: " + mesh.Name)
+	}
+	validateFiniteVec3(mesh.Position, "mesh " + mesh.Name + " position")?
+	validateFiniteVec3(mesh.Rotation, "mesh " + mesh.Name + " rotation")?
+	validateFiniteVec3(mesh.Scale, "mesh " + mesh.Name + " scale")?
+	validateFiniteColor(mesh.Tint, "mesh " + mesh.Name + " tint")?
+	validateFiniteNumbers("mesh " + mesh.Name, mesh.Friction, mesh.CullDistance, mesh.CullRadius)?
+	validateLodLevels(mesh.LodLevels, "mesh " + mesh.Name)?
+	if mesh.Collision != "" && mesh.Collision != MeshCollisionNone &&
+		mesh.Collision != MeshCollisionTrimesh {
+		return invalid("unsupported mesh collision: " + mesh.Name)
+	}
+	if mesh.CullDistance < 0 {
+		return invalid("mesh cullDistance must be >= 0: " + mesh.Name)
+	}
+	if mesh.CullRadius < 0 {
+		return invalid("mesh cullRadius must be >= 0: " + mesh.Name)
+	}
+	validateMaterial(mesh.Material, "mesh " + mesh.Name)?
+	validatePickMode(mesh.PickMode, "mesh " + mesh.Name)?
+	return nil
+}
+
+func validateLodLevels(levels []MeshLodLevel, owner string) error {
+	for _, lod := range levels {
+		if lod.Model == "" {
+			return invalid(owner + " lod model is required")
+		}
+		if lod.Distance < 0 {
+			return invalid(owner + " lod distance must be >= 0")
+		}
+		validateFiniteNumbers(owner + " lod", lod.Distance)?
+	}
+	return nil
+}
+
+func validateMeshTerrain(terrain MeshTerrain) error {
+	if terrain.Name == "" {
+		return invalid("mesh terrain name must not be empty")
+	}
+	if terrain.Model == "" {
+		return invalid("mesh terrain model is required: " + terrain.Name)
+	}
+	if terrain.HeightGrid == "" {
+		return invalid("mesh terrain heightGrid is required: " + terrain.Name)
+	}
+	validateFiniteNumbers("mesh terrain " + terrain.Name, terrain.CullDistance, terrain.CullRadius)?
+	validateLodLevels(terrain.LodLevels, "mesh terrain " + terrain.Name)?
+	if terrain.CullDistance < 0 {
+		return invalid("mesh terrain cullDistance must be >= 0: " + terrain.Name)
+	}
+	if terrain.CullRadius < 0 {
+		return invalid("mesh terrain cullRadius must be >= 0: " + terrain.Name)
+	}
+	validateTerrainSplat(terrain.Splat, "mesh terrain")?
+	validateMaterial(terrain.Material, "mesh terrain " + terrain.Name)?
+	validatePickMode(terrain.PickMode, "mesh terrain " + terrain.Name)?
+	return nil
+}
+
+func validatePrimitiveLayer(layer PrimitiveLayer) error {
+	if layer.Name == "" {
+		return invalid("primitive layer name must not be empty")
+	}
+	if layer.Source == "" {
+		return invalid("primitive layer source is required: " + layer.Name)
+	}
+	validateFiniteNumbers("primitive layer " + layer.Name, layer.ChunkCellSize)?
+	if layer.ChunkCellSize < 0 {
+		return invalid("primitive layer chunkCellSize must be >= 0: " + layer.Name)
+	}
+	if len(layer.Slots) == 0 {
+		return invalid("primitive layer slots are required: " + layer.Name)
+	}
+	if layer.Kind != "" && layer.Kind != PrimitiveLayerKindStatic &&
+		layer.Kind != PrimitiveLayerKindDynamic &&
+		layer.Kind != PrimitiveLayerKindTransparent {
+		return invalid("unsupported primitive layer kind: " + layer.Kind)
+	}
+	seen := map[string]bool{}
+	for _, slot := range layer.Slots {
+		if slot == "" {
+			return invalid("primitive layer slot name must not be empty: " + layer.Name)
+		}
+		if seen[slot] {
+			return invalid("duplicate primitive layer slot: " + layer.Name + "/" + slot)
+		}
+		seen[slot] = true
+	}
+	return nil
+}
+
+func validateMaterial(material Material, owner string) error {
+	validateFiniteColor(material.BaseColor, owner + " material baseColor")?
+	validateFiniteNumbers(owner + " material", material.Roughness, material.Metallic, material.NormalScale, material.UVScale, material.DetailStrength, material.MacroBlend, material.RoughnessResponse, material.ToonRampResponse)?
+	if material.Roughness < 0 {
+		return invalid(owner + " material roughness must be >= 0")
+	}
+	if material.Metallic < 0 || material.Metallic > 1 {
+		return invalid(owner + " material metallic must be in range 0..1")
+	}
+	if material.NormalScale < 0 {
+		return invalid(owner + " material normalScale must be >= 0")
+	}
+	if material.UVScale < 0 {
+		return invalid(owner + " material uvScale must be >= 0")
+	}
+	if material.DetailStrength < 0 {
+		return invalid(owner + " material detailStrength must be >= 0")
+	}
+	if material.MacroBlend < 0 {
+		return invalid(owner + " material macroBlend must be >= 0")
+	}
+	if material.RoughnessResponse < 0 {
+		return invalid(owner + " material roughnessResponse must be >= 0")
+	}
+	if material.ToonRampResponse < 0 {
+		return invalid(owner + " material toonRampResponse must be >= 0")
+	}
+	return nil
+}
+
+func validatePickMode(mode, owner string) error {
+	if mode == "" || mode == PickModeDefault || mode == PickModeEnabled || mode == PickModeDisabled {
+		return nil
+	}
+	return invalid(owner + " pickMode must be default, enabled, or disabled")
+}
+
+func invalid(message string) error {
+	return errors.New("scene3dmap: " + message)
+}
+
+func validateFiniteVec3(value Vec3, owner string) error {
+	return validateFiniteNumbers(owner, value.X, value.Y, value.Z)
+}
+
+func validateFiniteColor(value Color, owner string) error {
+	return validateFiniteNumbers(owner, value.R, value.G, value.B, value.A)
+}
+
+func validateFiniteNumbers(owner string, values ...float64) error {
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return invalid(owner + " contains a non-finite number")
+		}
+	}
+	return nil
+}

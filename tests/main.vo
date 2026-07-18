@@ -5,6 +5,7 @@ import (
 	"github.com/vo-lang/vopack"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func assert(cond bool, msg string) {
@@ -15,7 +16,7 @@ func assert(cond bool, msg string) {
 
 func mustReadFile(path string) []byte {
 	data, err := os.ReadFile(path)
-	assert(err == nil, "read file: "+path)
+	assert(err == nil, "read file: " + path)
 	return data
 }
 
@@ -26,8 +27,8 @@ func contains(s, needle string) bool {
 	if len(needle) > len(s) {
 		return false
 	}
-	for i := 0; i <= len(s)-len(needle); i++ {
-		if s[i:i+len(needle)] == needle {
+	for i := 0; i <= len(s) - len(needle); i++ {
+		if s[i:i + len(needle)] == needle {
 			return true
 		}
 	}
@@ -36,11 +37,102 @@ func contains(s, needle string) bool {
 
 func entryTableOffset(data []byte) int {
 	footerOff := len(data) - 32
-	return int(binary.LittleEndian.Uint64(data[footerOff+16 : footerOff+24]))
+	return int(binary.LittleEndian.Uint64(data[footerOff + 16:footerOff + 24]))
 }
 
 func entryOffset(data []byte, entryIndex int, fieldOffset int) int {
-	return entryTableOffset(data) + entryIndex*48 + fieldOffset
+	return entryTableOffset(data) + entryIndex * 48 + fieldOffset
+}
+
+func testCRC32(data []byte) uint32 {
+	crc := uint32(0xFFFFFFFF)
+	for _, b := range data {
+		crc ^= uint32(b)
+		for bit := 0; bit < 8; bit++ {
+			if crc & 1 != 0 {
+				crc = (crc >> 1) ^ 0xEDB88320
+			} else {
+				crc >>= 1
+			}
+		}
+	}
+	return crc ^ 0xFFFFFFFF
+}
+
+func mutateInternalManifest(data []byte, mode string) []byte {
+	result := make([]byte, len(data))
+	copy(result, data)
+	footerOff := len(result) - 32
+	pathPoolOff := int(binary.LittleEndian.Uint64(result[footerOff:]))
+	entryCount := int(binary.LittleEndian.Uint32(result[footerOff + 24:]))
+	for i := 0; i < entryCount; i++ {
+		pathOff := int(binary.LittleEndian.Uint32(result[entryOffset(result, i, 0):]))
+		pathLen := int(binary.LittleEndian.Uint16(result[entryOffset(result, i, 4):]))
+		name := string(result[pathPoolOff + pathOff:pathPoolOff + pathOff + pathLen])
+		if name != vopack.ManifestPath {
+			continue
+		}
+		dataOff := int(binary.LittleEndian.Uint64(result[entryOffset(result, i, 8):]))
+		dataLen := int(binary.LittleEndian.Uint64(result[entryOffset(result, i, 24):]))
+		manifest := string(result[dataOff:dataOff + dataLen])
+		mutated := manifest
+		switch mode {
+			case "missing-dependencies":
+				needle := ",\n      \"dependencies\": []"
+				mutated = strings.Replace(manifest, needle, strings.Repeat(" ", len(needle)), 1)
+			case "null-dependencies":
+				mutated = strings.Replace(manifest, "\"dependencies\": []", "\"dependencies\": null", 1)
+				mutated = strings.Replace(mutated, "\n      \"path\"", "\n    \"path\"", 1)
+			case "missing-dependency":
+				mutated = strings.Replace(manifest, "tracks/main/road.glb", "tracks/main/lost.glb", 1)
+			case "unsorted-dependencies":
+				canonical := "\"tracks/main/road.glb\",\n        \"tracks/main/road.png\""
+				unsorted := "\"tracks/main/road.png\",\n        \"tracks/main/road.glb\""
+				mutated = strings.Replace(manifest, canonical, unsorted, 1)
+			case "duplicate-dependencies":
+				mutated = strings.Replace(manifest, "tracks/main/road.png", "tracks/main/road.glb", 1)
+			case "source-mismatch":
+				mutated = strings.Replace(manifest, "textures/road.png", "textures/bike.png", 1)
+			case "closure-mismatch":
+				mutated = strings.ReplaceAll(manifest, "extra.bin", "ghost.bin")
+			case "invalid-content-hash":
+				mutated = strings.Replace(manifest, "crc32:", "CRC32:", 1)
+			case "content-hash-mismatch":
+				marker := "\"contentHash\": \"crc32:"
+				offset := strings.Index(manifest, marker)
+				assert(offset >= 0, "contentHash marker exists")
+				bytes := []byte(manifest)
+				digit := offset + len(marker)
+				if bytes[digit] == '0' {
+					bytes[digit] = '1'
+				} else {
+					bytes[digit] = '0'
+				}
+				mutated = string(bytes)
+			default:
+				panic("unknown manifest mutation: " + mode)
+		}
+		assert(mutated != manifest, "manifest mutation changed content: " + mode)
+		assert(len(mutated) == len(manifest), "manifest mutation preserved length: " + mode)
+		copy(result[dataOff:dataOff + dataLen], []byte(mutated))
+		binary.LittleEndian.PutUint32(result[entryOffset(result, i, 32):], testCRC32([]byte(mutated)))
+		return result
+	}
+	panic("manifest entry not found")
+}
+
+func mutateArchivePath(data []byte, old, replacement string) []byte {
+	assert(len(old) == len(replacement), "path mutation must preserve length")
+	result := make([]byte, len(data))
+	copy(result, data)
+	footerOff := len(result) - 32
+	pathPoolOff := int(binary.LittleEndian.Uint64(result[footerOff:]))
+	pathPoolLen := int(binary.LittleEndian.Uint64(result[footerOff + 8:]))
+	pathPool := string(result[pathPoolOff:pathPoolOff + pathPoolLen])
+	offset := strings.Index(pathPool, old)
+	assert(offset >= 0, "path mutation source exists: " + old)
+	copy(result[pathPoolOff + offset:pathPoolOff + offset + len(old)], []byte(replacement))
+	return result
 }
 
 func finalLZ4LiteralLen(src []byte) int {
@@ -49,7 +141,6 @@ func finalLZ4LiteralLen(src []byte) int {
 	for sPos < len(src) {
 		token := src[sPos]
 		sPos++
-
 		litLen := int(token >> 4)
 		if litLen == 15 {
 			for {
@@ -61,15 +152,13 @@ func finalLZ4LiteralLen(src []byte) int {
 				}
 			}
 		}
-
 		sPos += litLen
 		lastLitLen = litLen
 		if sPos >= len(src) {
 			return lastLitLen
 		}
-
 		sPos += 2
-		matchLen := int(token&0x0F) + 4
+		matchLen := int(token & 0x0F) + 4
 		if matchLen == 19 {
 			for {
 				extra := src[sPos]
@@ -88,11 +177,13 @@ func main() {
 	tmpDir, err := os.MkdirTemp("", "vopack-test-")
 	assert(err == nil, "create temp dir")
 	defer os.RemoveAll(tmpDir)
-
 	testBasicRoundTrip(tmpDir)
 	testCompression(tmpDir)
 	testMultipleEntries(tmpDir)
 	testRejectDuplicatePaths(tmpDir)
+	testPortablePathContract(tmpDir)
+	testRejectPathCollisions(tmpDir)
+	testReaderRejectsInvalidPathsAndCollisions(tmpDir)
 	testRejectUnsupportedCompression(tmpDir)
 	testRejectCorruptHeaderDataOffset(tmpDir)
 	testRejectUncompressedSizeMismatch(tmpDir)
@@ -106,100 +197,78 @@ func main() {
 	testLZ4Compress()
 	testLZ4StandardEnding()
 	testLZ4RejectMalformedInput()
-
 	println("ALL TESTS PASSED")
 }
 
 func testBasicRoundTrip(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "basic.vpak"})
-
+	path := filepath.Join(tmpDir, "basic.vpak")
 	// Write
 	w, err := vopack.Create(path)
 	assert(err == nil, "create basic archive")
-
 	err = w.Add("hello.txt", []byte("Hello, vopack!"), vopack.EntryOpts{})
 	assert(err == nil, "add hello.txt")
-
 	err = w.Close()
 	assert(err == nil, "close writer")
-
 	// Read
 	r, err := vopack.Open(path)
 	assert(err == nil, "open basic archive")
-
 	assert(r.Has("hello.txt"), "has hello.txt")
 	assert(!r.Has("nope.txt"), "has nope.txt should be false")
-
 	data, err := r.Read("hello.txt")
 	assert(err == nil, "read hello.txt")
-	assert(string(data) == "Hello, vopack!", "content mismatch: "+string(data))
-
+	assert(string(data) == "Hello, vopack!", "content mismatch: " + string(data))
 	size, err := r.Size("hello.txt")
 	assert(err == nil, "size hello.txt")
 	assert(size == 14, "size should be 14")
-
 	assert(r.Len() == 1, "len should be 1")
-
 	err = r.Close()
 	assert(err == nil, "close reader")
 }
 
 func testCompression(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "compressed.vpak"})
-
+	path := filepath.Join(tmpDir, "compressed.vpak")
 	// Create repetitive data that compresses well
 	data := make([]byte, 4096)
 	for i := 0; i < len(data); i++ {
 		data[i] = byte(i % 10) + 'A'
 	}
-
 	w, err := vopack.Create(path)
 	assert(err == nil, "create compressed archive")
-
 	err = w.Add("data.bin", data, vopack.EntryOpts{Compression: vopack.CompressLZ4})
 	assert(err == nil, "add compressed entry")
-
 	err = w.Close()
 	assert(err == nil, "close compressed writer")
-
 	// Read back
 	r, err := vopack.Open(path)
 	assert(err == nil, "open compressed archive")
-
 	result, err := r.Read("data.bin")
 	assert(err == nil, "read compressed data")
 	assert(len(result) == 4096, "decompressed size mismatch")
-
 	// Verify content
 	for i := 0; i < len(data); i++ {
 		assert(result[i] == data[i], "content byte mismatch at index")
 	}
-
+	err = r.VerifyManifest()
+	assert(err == nil, "compressed payload contentHash verifies after decompression")
 	err = r.Close()
 	assert(err == nil, "close compressed reader")
 }
 
 func testMultipleEntries(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "multi.vpak"})
-
+	path := filepath.Join(tmpDir, "multi.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create multi archive")
-
 	err = w.Add("a.txt", []byte("aaa"), vopack.EntryOpts{})
 	assert(err == nil, "add a.txt")
 	err = w.Add("b.txt", []byte("bbb"), vopack.EntryOpts{})
 	assert(err == nil, "add b.txt")
 	err = w.Add("c.txt", []byte("ccc"), vopack.EntryOpts{})
 	assert(err == nil, "add c.txt")
-
 	err = w.Close()
 	assert(err == nil, "close multi writer")
-
 	r, err := vopack.Open(path)
 	assert(err == nil, "open multi archive")
-
 	assert(r.Len() == 3, "multi len should be 3")
-
 	da, err := r.Read("a.txt")
 	assert(err == nil, "read a.txt")
 	db, err := r.Read("b.txt")
@@ -209,118 +278,186 @@ func testMultipleEntries(tmpDir string) {
 	assert(string(da) == "aaa", "a content")
 	assert(string(db) == "bbb", "b content")
 	assert(string(dc) == "ccc", "c content")
-
 	err = r.Close()
 	assert(err == nil, "close multi reader")
 }
 
 func testRejectDuplicatePaths(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "duplicate.vpak"})
-
+	path := filepath.Join(tmpDir, "duplicate.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create duplicate archive")
-
 	err = w.Add("dup.txt", []byte("first"), vopack.EntryOpts{})
 	assert(err == nil, "add first duplicate candidate")
-
 	err = w.Add("dup.txt", []byte("second"), vopack.EntryOpts{})
 	assert(err != nil, "duplicate path should fail")
-
 	err = w.Close()
 	assert(err == nil, "close duplicate archive")
-
 	r, err := vopack.Open(path)
 	assert(err == nil, "open duplicate archive")
 	assert(r.Len() == 1, "duplicate archive should contain exactly one entry")
-
 	data, err := r.Read("dup.txt")
 	assert(err == nil, "read surviving duplicate entry")
 	assert(string(data) == "first", "duplicate archive should retain first entry")
-
 	err = r.Close()
 	assert(err == nil, "close duplicate archive reader")
 }
 
-func testRejectUnsupportedCompression(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "unsupported-compression.vpak"})
+func testPortablePathContract(tmpDir string) {
+	path := filepath.Join(tmpDir, "portable-paths.vpak")
+	w, err := vopack.Create(path)
+	assert(err == nil, "create portable path archive")
+	invalid := []string{
+		"", "/root", "trailing/", "double//slash", ".", "..", "a/./b", "a/../b", "Upper.txt", "é.txt",
+		"control\nname", "back\\slash", "colon:name", "question?mark", "star*name", "less<name",
+		"greater>name", "quote\"name", "pipe|name", "tail.", "con", "con.txt", "prn", "aux.bin", "nul",
+		"com1", "com9.log", "lpt1", "lpt9.txt", ".vopack", ".vopack/manifest.json", ".vopack/private.bin",
+		strings.Repeat("a", 256), strings.Repeat("a/", 2048) + "a",
+	}
+	for _, name := range invalid {
+		err = w.Add(name, []byte("x"), vopack.EntryOpts{})
+		assert(err != nil, "invalid portable path rejected: " + name)
+	}
+	err = w.Add("valid-dir/.hidden_1-file.bin", []byte("ok"), vopack.EntryOpts{})
+	assert(err == nil, "valid portable path accepted")
+	err = w.Add(strings.Repeat("b", 255), []byte("component-boundary"), vopack.EntryOpts{})
+	assert(err == nil, "255-byte portable component accepted")
+	err = w.Add(strings.Repeat("a/", 2047) + "aa", []byte("path-boundary"), vopack.EntryOpts{})
+	assert(err == nil, "4096-byte portable path accepted")
+	err = w.Close()
+	assert(err == nil, "close portable path archive")
+}
 
+func testRejectPathCollisions(tmpDir string) {
+	path := filepath.Join(tmpDir, "ancestor-first.vpak")
+	w, err := vopack.Create(path)
+	assert(err == nil, "create ancestor-first archive")
+	err = w.Add("models", []byte("file"), vopack.EntryOpts{})
+	assert(err == nil, "add ancestor file")
+	err = w.Add("models/car.glb", []byte("child"), vopack.EntryOpts{})
+	assert(err != nil, "writer rejects file as directory ancestor")
+	err = w.Close()
+	assert(err == nil, "close ancestor-first archive")
+	path = filepath.Join(tmpDir, "descendant-first.vpak")
+	w, err = vopack.Create(path)
+	assert(err == nil, "create descendant-first archive")
+	err = w.Add("models/car.glb", []byte("child"), vopack.EntryOpts{})
+	assert(err == nil, "add descendant file")
+	err = w.Add("models", []byte("file"), vopack.EntryOpts{})
+	assert(err != nil, "writer rejects directory path after descendant")
+	err = w.Close()
+	assert(err == nil, "close descendant-first archive")
+}
+
+func testReaderRejectsInvalidPathsAndCollisions(tmpDir string) {
+	path := filepath.Join(tmpDir, "reader-invalid-source.vpak")
+	w, err := vopack.Create(path)
+	assert(err == nil, "create reader invalid source")
+	err = w.Add("a.txt", []byte("a"), vopack.EntryOpts{})
+	assert(err == nil, "add reader invalid source asset")
+	err = w.Close()
+	assert(err == nil, "close reader invalid source")
+	invalid := mutateArchivePath(mustReadFile(path), "a.txt", "A.txt")
+	invalidPath := filepath.Join(tmpDir, "reader-invalid.vpak")
+	err = os.WriteFile(invalidPath, invalid, 0644)
+	assert(err == nil, "write invalid reader path archive")
+	_, err = vopack.Open(invalidPath)
+	assert(err != nil, "reader rejects non-canonical archive path")
+	path = filepath.Join(tmpDir, "reader-reserved-source.vpak")
+	w, err = vopack.Create(path)
+	assert(err == nil, "create reader reserved namespace source")
+	err = w.Add("xvopack/foo", []byte("reserved"), vopack.EntryOpts{})
+	assert(err == nil, "add reserved namespace mutation source")
+	err = w.Close()
+	assert(err == nil, "close reader reserved namespace source")
+	reserved := mutateArchivePath(mustReadFile(path), "xvopack/foo", ".vopack/foo")
+	reservedPath := filepath.Join(tmpDir, "reader-reserved.vpak")
+	err = os.WriteFile(reservedPath, reserved, 0644)
+	assert(err == nil, "write reader reserved namespace archive")
+	_, err = vopack.Open(reservedPath)
+	assert(err != nil, "reader rejects reserved .vopack namespace")
+	path = filepath.Join(tmpDir, "reader-collision-source.vpak")
+	w, err = vopack.Create(path)
+	assert(err == nil, "create reader collision source")
+	err = w.Add("ab.bin", []byte("a"), vopack.EntryOpts{})
+	assert(err == nil, "add collision mutation source")
+	err = w.Add("aa.bin/x", []byte("b"), vopack.EntryOpts{})
+	assert(err == nil, "add collision descendant")
+	err = w.Close()
+	assert(err == nil, "close reader collision source")
+	collision := mutateArchivePath(mustReadFile(path), "ab.bin", "aa.bin")
+	collisionPath := filepath.Join(tmpDir, "reader-collision.vpak")
+	err = os.WriteFile(collisionPath, collision, 0644)
+	assert(err == nil, "write reader collision archive")
+	_, err = vopack.Open(collisionPath)
+	assert(err != nil, "reader rejects file/directory collision")
+}
+
+func testRejectUnsupportedCompression(tmpDir string) {
+	path := filepath.Join(tmpDir, "unsupported-compression.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create unsupported compression archive")
-
 	err = w.Add("bad.bin", []byte("x"), vopack.EntryOpts{Compression: 99})
 	assert(err != nil, "unsupported compression should fail")
-
 	err = w.Close()
 	assert(err == nil, "close unsupported compression archive")
 }
 
 func testRejectCorruptHeaderDataOffset(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "corrupt-header.vpak"})
-
+	path := filepath.Join(tmpDir, "corrupt-header.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create corrupt header archive")
 	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
 	assert(err == nil, "add corrupt header entry")
 	err = w.Close()
 	assert(err == nil, "close corrupt header archive")
-
 	data, err := os.ReadFile(path)
 	assert(err == nil, "read corrupt header archive")
 	data[8] = 0
 	err = os.WriteFile(path, data, 0644)
 	assert(err == nil, "rewrite corrupt header archive")
-
 	_, err = vopack.Open(path)
 	assert(err != nil, "corrupt header data offset should fail")
 }
 
 func testRejectUncompressedSizeMismatch(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "size-mismatch.vpak"})
-
+	path := filepath.Join(tmpDir, "size-mismatch.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create size mismatch archive")
 	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
 	assert(err == nil, "add size mismatch entry")
 	err = w.Close()
 	assert(err == nil, "close size mismatch archive")
-
 	data, err := os.ReadFile(path)
 	assert(err == nil, "read size mismatch archive")
 	footerOff := len(data) - 32
-	entryTableOff := int(binary.LittleEndian.Uint64(data[footerOff+16 : footerOff+24]))
-	binary.LittleEndian.PutUint64(data[entryTableOff+16:], 99)
+	entryTableOff := int(binary.LittleEndian.Uint64(data[footerOff + 16:footerOff + 24]))
+	binary.LittleEndian.PutUint64(data[entryTableOff + 16:], 99)
 	err = os.WriteFile(path, data, 0644)
 	assert(err == nil, "rewrite size mismatch archive")
-
 	_, err = vopack.Open(path)
 	assert(err != nil, "uncompressed size mismatch should fail")
 }
 
 func testRejectCorruptReservedEntryBytes(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "reserved-bytes.vpak"})
-
+	path := filepath.Join(tmpDir, "reserved-bytes.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create reserved bytes archive")
 	err = w.Add("a.txt", []byte("abc"), vopack.EntryOpts{})
 	assert(err == nil, "add reserved bytes entry")
 	err = w.Close()
 	assert(err == nil, "close reserved bytes archive")
-
 	data := mustReadFile(path)
 	data[entryOffset(data, 0, 36)] = 1
 	err = os.WriteFile(path, data, 0644)
 	assert(err == nil, "rewrite reserved bytes archive")
-
 	_, err = vopack.Open(path)
 	assert(err != nil, "non-zero reserved entry bytes should fail")
 }
 
 func testListPrefix(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "list.vpak"})
-
+	path := filepath.Join(tmpDir, "list.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create list archive")
-
 	err = w.Add("textures/sky.png", []byte("sky"), vopack.EntryOpts{})
 	assert(err == nil, "add textures/sky.png")
 	err = w.Add("textures/ground.png", []byte("ground"), vopack.EntryOpts{})
@@ -331,40 +468,35 @@ func testListPrefix(tmpDir string) {
 	assert(err == nil, "add config.json")
 	err = w.Close()
 	assert(err == nil, "close list archive")
-
 	r, err := vopack.Open(path)
 	assert(err == nil, "open list archive")
-
 	all := r.List("")
 	assert(len(all) == 4, "list all should be 4")
-
 	textures := r.List("textures/")
 	assert(len(textures) == 2, "list textures/ should be 2")
-
 	sounds := r.List("sounds/")
 	assert(len(sounds) == 1, "list sounds/ should be 1")
-
 	none := r.List("nope/")
 	assert(len(none) == 0, "list nope/ should be 0")
-
 	err = r.Close()
 	assert(err == nil, "close list reader")
 }
 
 func testManifest(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "manifest.vpak"})
-
+	path := filepath.Join(tmpDir, "manifest.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create manifest archive")
 	w.SetManifestInfo("test-pack", "1.2.3")
-	srcPath := filepath.Join([]string{tmpDir, "road.png"})
+	srcPath := filepath.Join(tmpDir, "road.png")
 	err = os.WriteFile(srcPath, []byte("road-texture"), 0644)
 	assert(err == nil, "write manifest source")
 	err = w.AddFile("textures/road.png", srcPath, vopack.EntryOpts{Type: "texture"})
 	assert(err == nil, "add manifest texture")
 	err = w.Close()
 	assert(err == nil, "close manifest archive")
-
+	archive := mustReadFile(path)
+	assert(contains(string(archive), "\"dependencies\": []"), "manifest encodes empty dependencies as []")
+	assert(!contains(string(archive), "\"dependencies\": null"), "manifest never encodes null dependencies")
 	r, err := vopack.Open(path)
 	assert(err == nil, "open manifest archive")
 	assert(r.Len() == 1, "manifest metadata should not count as resource")
@@ -377,53 +509,168 @@ func testManifest(tmpDir string) {
 	assert(manifest.Assets[0].Path == "textures/road.png", "manifest asset path")
 	assert(manifest.Assets[0].Type == "texture", "manifest asset type")
 	assert(manifest.Assets[0].ContentHash != "", "manifest asset hash")
-	assert(manifest.Assets[0].SourcePath != "", "manifest source path")
+	assert(manifest.Assets[0].SourcePath == manifest.Assets[0].Path, "manifest source identity equals asset path")
+	assert(manifest.Assets[0].SourcePath != srcPath, "manifest never stores the host source path")
+	assert(manifest.Assets[0].Dependencies != nil, "typed manifest dependencies remain non-nil")
+	assert(len(manifest.Assets[0].Dependencies) == 0, "typed manifest dependencies are empty")
+	err = r.VerifyManifest()
+	assert(err == nil, "full manifest closure and content hash verify")
 	_, err = r.Read(vopack.ManifestPath)
 	assert(err != nil, "manifest should not read as normal resource")
 	err = r.Close()
 	assert(err == nil, "close manifest reader")
+	nullPath := filepath.Join(tmpDir, "manifest-null-dependencies.vpak")
+	err = os.WriteFile(nullPath, mutateInternalManifest(archive, "null-dependencies"), 0644)
+	assert(err == nil, "write null dependencies manifest")
+	r, err = vopack.Open(nullPath)
+	assert(err == nil, "open null dependencies archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects null dependencies")
+	r.Close()
+	missingPath := filepath.Join(tmpDir, "manifest-missing-dependencies.vpak")
+	err = os.WriteFile(missingPath, mutateInternalManifest(archive, "missing-dependencies"), 0644)
+	assert(err == nil, "write missing dependencies manifest")
+	r, err = vopack.Open(missingPath)
+	assert(err == nil, "open missing dependencies archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects missing dependencies")
+	r.Close()
+	sourceMismatchPath := filepath.Join(tmpDir, "manifest-source-mismatch.vpak")
+	err = os.WriteFile(sourceMismatchPath, mutateInternalManifest(archive, "source-mismatch"), 0644)
+	assert(err == nil, "write mismatched source identity manifest")
+	r, err = vopack.Open(sourceMismatchPath)
+	assert(err == nil, "open mismatched source identity archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects source identity drift")
+	r.Close()
+	invalidHashPath := filepath.Join(tmpDir, "manifest-invalid-content-hash.vpak")
+	err = os.WriteFile(invalidHashPath, mutateInternalManifest(archive, "invalid-content-hash"), 0644)
+	assert(err == nil, "write malformed contentHash manifest")
+	r, err = vopack.Open(invalidHashPath)
+	assert(err == nil, "open malformed contentHash archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects malformed contentHash")
+	r.Close()
+	mismatchedHashPath := filepath.Join(tmpDir, "manifest-mismatched-content-hash.vpak")
+	err = os.WriteFile(mismatchedHashPath, mutateInternalManifest(archive, "content-hash-mismatch"), 0644)
+	assert(err == nil, "write mismatched contentHash manifest")
+	r, err = vopack.Open(mismatchedHashPath)
+	assert(err == nil, "open mismatched contentHash archive")
+	err = r.VerifyManifest()
+	assert(err != nil, "full verifier rejects contentHash mismatch")
+	r.Close()
 }
 
 func testManifestDependencies(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "manifest-deps.vpak"})
+	path := filepath.Join(tmpDir, "manifest-deps.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create manifest deps archive")
-	err = w.Add("tracks/main/track.json", []byte("{}"), vopack.EntryOpts{Type: "track", Dependencies: []string{"tracks/main/road.glb", "tracks/main/road.png"}})
+	err = w.Add("tracks/main/track.json", []byte("{}"), vopack.EntryOpts{
+		Type: "track", Dependencies: []string{"tracks/main/road.png", "tracks/main/road.glb"},
+	})
 	assert(err == nil, "add track with deps")
-	err = w.Add("tracks/main/road.glb", []byte("road"), vopack.EntryOpts{Type: "model", Dependencies: []string{"tracks/main/road.png"}})
+	err = w.Add("tracks/main/road.glb", []byte("road"), vopack.EntryOpts{
+		Type: "model", Dependencies: []string{"tracks/main/road.png"},
+	})
 	assert(err == nil, "add road model with deps")
 	err = w.Add("tracks/main/road.png", []byte("texture"), vopack.EntryOpts{Type: "texture"})
 	assert(err == nil, "add road texture")
 	err = w.Close()
 	assert(err == nil, "close manifest deps archive")
-
 	r, err := vopack.Open(path)
 	assert(err == nil, "open manifest deps archive")
+	manifest, err := r.Manifest()
+	assert(err == nil, "read sorted dependency manifest")
+	track := manifest.Find("tracks/main/track.json")
+	assert(track != nil && len(track.Dependencies) == 2, "track dependencies decoded")
+	assert(track.Dependencies[0] == "tracks/main/road.glb" &&
+		track.Dependencies[1] == "tracks/main/road.png", "writer canonicalizes dependency order")
 	err = r.VerifyManifestDependencies("tracks/main/track.json")
 	assert(err == nil, "verify manifest deps")
 	err = r.Close()
 	assert(err == nil, "close manifest deps reader")
-
-	broken := filepath.Join([]string{tmpDir, "manifest-deps-broken.vpak"})
-	w, err = vopack.Create(broken)
-	assert(err == nil, "create broken manifest deps archive")
-	err = w.Add("tracks/main/track.json", []byte("{}"), vopack.EntryOpts{Type: "track", Dependencies: []string{"tracks/main/missing.glb"}})
-	assert(err == nil, "add broken track")
+	canonicalArchive := mustReadFile(path)
+	unsortedPath := filepath.Join(tmpDir, "manifest-deps-unsorted.vpak")
+	err = os.WriteFile(unsortedPath, mutateInternalManifest(canonicalArchive, "unsorted-dependencies"), 0644)
+	assert(err == nil, "write unsorted dependency archive")
+	r, err = vopack.Open(unsortedPath)
+	assert(err == nil, "open unsorted dependency archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects unsorted dependencies")
+	r.Close()
+	duplicatePath := filepath.Join(tmpDir, "manifest-deps-duplicate.vpak")
+	err = os.WriteFile(duplicatePath, mutateInternalManifest(canonicalArchive, "duplicate-dependencies"), 0644)
+	assert(err == nil, "write duplicate dependency archive")
+	r, err = vopack.Open(duplicatePath)
+	assert(err == nil, "open duplicate dependency archive")
+	_, err = r.Manifest()
+	assert(err != nil, "manifest decoder rejects duplicate dependencies")
+	r.Close()
+	invalid := filepath.Join(tmpDir, "manifest-deps-invalid.vpak")
+	w, err = vopack.Create(invalid)
+	assert(err == nil, "create invalid dependency archive")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{Dependencies: []string{""}})
+	assert(err != nil, "writer rejects empty dependency")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{
+		Dependencies: []string{".vopack/private.bin"},
+	})
+	assert(err != nil, "writer rejects dependency in reserved namespace")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{
+		Dependencies: []string{"tracks/main/Upper.bin"},
+	})
+	assert(err != nil, "writer rejects non-canonical dependency path")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{
+		Dependencies: []string{"tracks/main/owner.json"},
+	})
+	assert(err != nil, "writer rejects self dependency")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{
+		Dependencies: []string{"tracks/main/item.bin", "tracks/main/item.bin"},
+	})
+	assert(err != nil, "writer rejects duplicate dependency")
+	err = w.Add("tracks/main/owner.json", []byte("{}"), vopack.EntryOpts{
+		Dependencies: []string{"tracks/main/missing.glb"},
+	})
+	assert(err == nil, "writer accepts a canonical forward dependency")
 	err = w.Close()
-	assert(err == nil, "close broken manifest deps archive")
+	assert(err != nil, "writer rejects missing dependency before finalization")
+	err = w.Add("tracks/main/missing.glb", []byte("model"), vopack.EntryOpts{})
+	assert(err == nil, "writer remains recoverable after dependency preflight")
+	err = w.Close()
+	assert(err == nil, "writer finalizes after dependency is declared and packed")
+	broken := filepath.Join(tmpDir, "manifest-deps-broken.vpak")
+	brokenData := mutateInternalManifest(mustReadFile(path), "missing-dependency")
+	err = os.WriteFile(broken, brokenData, 0644)
+	assert(err == nil, "write broken manifest dependency archive")
 	r, err = vopack.Open(broken)
 	assert(err == nil, "open broken manifest deps archive")
 	err = r.VerifyManifestDependencies("tracks/main/track.json")
 	assert(err != nil, "missing manifest dependency should fail")
-	assert(contains(err.Error(), "tracks/main/track.json") && contains(err.Error(), "tracks/main/missing.glb"), "dependency error includes requester and missing path")
+	assert(contains(err.Error(), "tracks/main/track.json") &&
+		contains(err.Error(), "tracks/main/lost.glb"), "dependency error includes requester and missing path")
 	err = r.Close()
 	assert(err == nil, "close broken manifest deps reader")
+	closureSource := filepath.Join(tmpDir, "manifest-closure-source.vpak")
+	w, err = vopack.Create(closureSource)
+	assert(err == nil, "create manifest closure source")
+	err = w.Add("kept.bin", []byte("kept"), vopack.EntryOpts{})
+	assert(err == nil, "add kept closure asset")
+	err = w.Add("extra.bin", []byte("extra"), vopack.EntryOpts{})
+	assert(err == nil, "add extra closure asset")
+	err = w.Close()
+	assert(err == nil, "close manifest closure source")
+	closurePath := filepath.Join(tmpDir, "manifest-closure-mismatch.vpak")
+	err = os.WriteFile(closurePath, mutateInternalManifest(mustReadFile(closureSource), "closure-mismatch"), 0644)
+	assert(err == nil, "write manifest closure mismatch")
+	r, err = vopack.Open(closurePath)
+	assert(err == nil, "open manifest closure mismatch")
+	err = r.VerifyManifest()
+	assert(err != nil, "full verifier rejects manifest/public-entry closure mismatch")
+	r.Close()
 }
 
 func testMountOverlay(tmpDir string) {
-	basePath := filepath.Join([]string{tmpDir, "base.vpak"})
-	patchPath := filepath.Join([]string{tmpDir, "patch.vpak"})
-
+	basePath := filepath.Join(tmpDir, "base.vpak")
+	patchPath := filepath.Join(tmpDir, "patch.vpak")
 	// Base archive
 	w, err := vopack.Create(basePath)
 	assert(err == nil, "create base archive")
@@ -433,7 +680,6 @@ func testMountOverlay(tmpDir string) {
 	assert(err == nil, "add base enemy")
 	err = w.Close()
 	assert(err == nil, "close base archive")
-
 	// Patch archive overrides hero
 	w, err = vopack.Create(patchPath)
 	assert(err == nil, "create patch archive")
@@ -443,63 +689,51 @@ func testMountOverlay(tmpDir string) {
 	assert(err == nil, "add patch item")
 	err = w.Close()
 	assert(err == nil, "close patch archive")
-
 	// Mount with priority
 	m := vopack.NewMountSet()
 	err = m.Mount(basePath, 0)
 	assert(err == nil, "mount base")
 	err = m.Mount(patchPath, 10)
 	assert(err == nil, "mount patch")
-
 	// Patch should override hero
 	hero, err := m.Read("hero.png")
 	assert(err == nil, "read hero from mount")
 	assert(string(hero) == "patched-hero", "hero should be patched")
-
 	// Base enemy still accessible
 	enemy, err := m.Read("enemy.png")
 	assert(err == nil, "read enemy from mount")
 	assert(string(enemy) == "base-enemy", "enemy should be base")
-
 	// New item from patch
 	item, err := m.Read("new-item.png")
 	assert(err == nil, "read new-item from mount")
 	assert(string(item) == "new-item", "new-item content")
-
 	// List should be merged and deduplicated
 	all := m.List("")
 	assert(len(all) == 3, "mount list should be 3 (hero, enemy, new-item)")
-
 	assert(m.Has("hero.png"), "mount has hero")
 	assert(!m.Has("nope.png"), "mount has nope should be false")
-
 	err = m.Close()
 	assert(err == nil, "close mount set")
 }
 
 func testEmptyArchive(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "empty.vpak"})
-
+	path := filepath.Join(tmpDir, "empty.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create empty archive")
 	err = w.Close()
 	assert(err == nil, "close empty writer")
-
 	r, err := vopack.Open(path)
 	assert(err == nil, "open empty archive")
 	assert(r.Len() == 0, "empty archive len should be 0")
 	assert(!r.Has("anything"), "empty has should be false")
-
 	all := r.List("")
 	assert(len(all) == 0, "empty list should be 0")
-
 	err = r.Close()
 	assert(err == nil, "close empty archive reader")
 }
 
 func testAlignmentLayout(tmpDir string) {
-	path := filepath.Join([]string{tmpDir, "alignment.vpak"})
-
+	path := filepath.Join(tmpDir, "alignment.vpak")
 	w, err := vopack.Create(path)
 	assert(err == nil, "create alignment archive")
 	err = w.Add("a.bin", []byte("abc"), vopack.EntryOpts{})
@@ -508,27 +742,23 @@ func testAlignmentLayout(tmpDir string) {
 	assert(err == nil, "add b.bin")
 	err = w.Close()
 	assert(err == nil, "close alignment archive")
-
 	data := mustReadFile(path)
 	bDataOff := binary.LittleEndian.Uint64(data[entryOffset(data, 1, 8):])
-	assert(bDataOff%64 == 0, "aligned entry data offset should be 64-byte aligned")
+	assert(bDataOff % 64 == 0, "aligned entry data offset should be 64-byte aligned")
 }
 
 func testLZ4Compress() {
 	// Test round-trip on various data patterns
-
 	// 1. Empty
 	c := vopack.Compress([]byte{})
 	assert(len(c) == 0, "compress empty")
 	d, err := vopack.Decompress(c, 0)
 	assert(err == nil, "decompress empty")
 	assert(len(d) == 0, "decompress empty len")
-
 	// 2. Short data (< 13 bytes, cannot compress smaller)
 	short := []byte("Hello!")
 	c = vopack.Compress(short)
 	assert(c == nil, "short data should not compress")
-
 	// 3. Highly repetitive data
 	rep := make([]byte, 10000)
 	for i := 0; i < len(rep); i++ {
@@ -542,11 +772,10 @@ func testLZ4Compress() {
 	for i := 0; i < len(rep); i++ {
 		assert(d[i] == rep[i], "repetitive byte mismatch")
 	}
-
 	// 4. Random-ish data (may not compress)
 	rnd := make([]byte, 1000)
 	for i := 0; i < len(rnd); i++ {
-		rnd[i] = byte((i*7 + 13) % 256)
+		rnd[i] = byte((i * 7 + 13) % 256)
 	}
 	c = vopack.Compress(rnd)
 	if c != nil {
@@ -565,11 +794,9 @@ func testLZ4StandardEnding() {
 	for i := 0; i < len(rep); i++ {
 		rep[i] = byte(i % 4)
 	}
-
 	c := vopack.Compress(rep)
 	assert(c != nil, "standard ending input should compress")
 	assert(finalLZ4LiteralLen(c) >= 5, "compressed block should end with at least 5 trailing literals")
-
 	d, err := vopack.Decompress(c, len(rep))
 	assert(err == nil, "decompress standard ending block")
 	for i := 0; i < len(rep); i++ {
@@ -580,7 +807,6 @@ func testLZ4StandardEnding() {
 func testLZ4RejectMalformedInput() {
 	_, err := vopack.Decompress([]byte{0}, 0)
 	assert(err != nil, "non-empty compressed data for empty output should fail")
-
 	_, err = vopack.Decompress([]byte{0x1f, 'A', 0x01, 0x00, 0xff}, 275)
 	assert(err != nil, "truncated match length should fail")
 }
